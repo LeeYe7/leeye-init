@@ -24,7 +24,16 @@ LeeYe Init 是一套面向 Debian、Ubuntu 系统的 VPS 的中文交互式初�
 
 ## 快速开始
 
-在服务器上下载或克隆本仓库后执行：
+### 通过 GitHub Raw 下载
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/LeeYe7/leeye-init/main/leeye-init -o leeye-init
+sudo bash leeye-init
+```
+
+### 下载或克隆仓库后运行
+
+在服务器上下载脚本或克隆本仓库后执行：
 
 ```bash
 cd leeye-init
@@ -38,12 +47,15 @@ sudo ./leeye-init
 sudo bash leeye-init
 ```
 
+### 安装快捷命令
+
 首次进入交互菜单时，脚本会询问是否安装快捷命令。确认后会执行以下操作：
 
 - 安装脚本到 `/usr/local/bin/leeye-init`
-- 创建 `/usr/local/bin/ini`    
+- 创建 `/usr/local/bin/ini`
 
 以后输入 `sudo ini` 即可打开主菜单。普通用户在交互式终端直接执行 `ini` 时，脚本也会尝试通过 `sudo` 提权。
+
 
 ## 命令行参数
 
@@ -61,13 +73,11 @@ ini --help               # 查看帮助
 ## 建议操作顺序
 
 1. 确认云厂商安全组、VNC 或控制台救援入口可用，并保持当前 SSH 会话。
-2. 运行 `sudo ./leeye-init`或`sudo ini`，进入菜单，查看准备执行的命令和配置内容。
+2. 运行 `sudo ./leeye-init` 或 `sudo ini`，进入菜单，查看准备执行的命令和配置内容。
 3. 通过菜单 1 更新系统并安装所需环境。
 4. 如需修改 SSH 端口，先在云厂商安全组和 UFW 中放行新端口，再使用菜单 3。
 5. 创建管理用户并配置 SSH 公钥，确认新用户可以登录后，再禁用密码认证。
 6. 按需要配置 Fail2ban、时区、Swap 和 BBR，最后运行菜单 99 检查状态。
-
-
 
 
 ## 备份、日志与恢复
@@ -103,6 +113,7 @@ sudo ini --restore <备份批次名称>
 
 配置备份只覆盖该事务记录的文件与运行状态。APT 更新、软件包安装、用户创建、密码修改及已经执行的系统命令无法整体回滚。脚本发现未完成事务时只会提示批次和状态，不会在下次启动时自行回滚。
 
+
 ## 脚本管理的主要路径
 
 | 路径 | 用途 |
@@ -116,7 +127,5 @@ sudo ini --restore <备份批次名称>
 | `/etc/modules-load.d/vps-init-bbr.conf` | BBR 模块加载配置 |
 | `/etc/sysctl.d/99-vps-init-bbr.conf` | BBR 内核参数 |
 | `/swapfile`、`/etc/fstab` | 脚本管理的 Swap 文件与持久化条目 |
-
-
 
 在生产服务器上操作前，请先确认你有可用备份和独立的控制台登录方式。
