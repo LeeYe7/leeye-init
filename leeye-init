@@ -1,0 +1,3722 @@
+#!/usr/bin/env bash
+
+# LeeYe VPS initialization and optimization menu
+
+set -uo pipefail
+IFS=$' \t\n'
+umask 077
+
+readonly SCRIPT_NAME="leeye-init"
+readonly SCRIPT_VERSION="1.1.2"
+readonly LOG_ROOT="/var/log/vps-init"
+readonly BACKUP_ROOT="/var/backups/vps-init"
+readonly MANAGED_HEADER="# Managed by leeye-init"
+readonly LEGACY_MANAGED_HEADER="# Managed by vps-init.sh"
+readonly INSTALL_PATH="/usr/local/bin/leeye-init"
+readonly SHORTCUT_PATH="/usr/local/bin/ini"
+readonly NECESSARY_PACKAGES=(
+  sudo curl wget ca-certificates unzip tar lsof ufw fail2ban openssh-client
+)
+readonly FULL_EXTRA_PACKAGES=(
+  nano vim git htop tmux screen jq python3 python3-pip python3-venv python3-systemd
+)
+readonly APT_OPTIONS=(
+  -o Acquire::Retries=2
+  -o Acquire::http::Timeout=20
+  -o Acquire::https::Timeout=20
+  -o DPkg::Lock::Timeout=60
+)
+
+DRY_RUN=0
+LOG_FILE=""
+RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
+BACKUP_DIR=""
+BACKUP_SEQUENCE=0
+OS_ID=""
+OS_NAME=""
+TEMP_DIR=""
+TRANSACTION_ACTIVE=0
+TRANSACTION_STATUS=""
+TRANSACTION_STATUS_FILE=""
+TRANSACTION_ROLLBACK_HANDLER=""
+INTERRUPTED=0
+MANUAL_RECOVERY_REQUIRED=0
+LOG_WRITE_FAILED=0
+FAIL2BAN_WAS_ACTIVE=0
+FAIL2BAN_WAS_ENABLED=0
+BBR_OLD_ALGORITHM=""
+BBR_OLD_QDISC=""
+SWAP_OLD_SIZE_MIB=0
+SWAP_OLD_ACTIVE=0
+SWAP_OLD_FS_TYPE=""
+
+declare -A BACKED_UP=()
+declare -A ORIGINAL_STATE=()
+declare -A ORIGINAL_HASH=()
+declare -A RESTORE_METADATA=()
+declare -a PARSED_PORTS=()
+declare -A RESTORE_GUARD_METADATA=()
+declare -a RESTORE_GUARD_PATHS=()
+PARSED_PORT_TOTAL=0
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'
+  C_BOLD=$'\033[1m'
+  C_RESET=$'\033[0m'
+else
+  C_RED=""
+  C_GREEN=""
+  C_YELLOW=""
+  C_BLUE=""
+  C_BOLD=""
+  C_RESET=""
+fi
+
+log_event() {
+  local level="$1"
+  shift
+  [[ -n "$LOG_FILE" ]] || return 0
+  if ! printf '%s [%s] %s\n' "$(date '+%F %T')" "$level" "$*" >>"$LOG_FILE"; then
+    if (( LOG_WRITE_FAILED == 0 )); then
+      printf '[警告] 无法继续写入日志: %s\n' "$LOG_FILE" >&2
+    fi
+    LOG_WRITE_FAILED=1
+  fi
+  return 0
+}
+
+info() {
+  printf '%s[信息]%s %s\n' "$C_BLUE" "$C_RESET" "$*"
+  log_event INFO "$*"
+}
+
+success() {
+  printf '%s[成功]%s %s\n' "$C_GREEN" "$C_RESET" "$*"
+  log_event SUCCESS "$*"
+}
+
+warn() {
+  printf '%s[警告]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2
+  log_event WARN "$*"
+}
+
+error() {
+  printf '%s[失败]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2
+  log_event ERROR "$*"
+}
+
+heading() {
+  printf '\n%s%s%s\n' "$C_BOLD" "$*" "$C_RESET"
+}
+
+print_spaced_menu() {
+  local item
+  local first=1
+  for item in "$@"; do
+    (( first )) || printf '\n'
+    printf '%s\n' "$item"
+    first=0
+  done
+}
+
+pause_menu() {
+  local ignored
+  printf '\n按 Enter 返回主菜单'
+  IFS= read -r ignored || true
+}
+
+confirm() {
+  local prompt="$1"
+  local answer
+  printf '%s [y/N]: ' "$prompt"
+  IFS= read -r answer || return 1
+  [[ "$answer" == "y" || "$answer" == "Y" ]]
+}
+
+confirm_default_yes() {
+  local prompt="$1"
+  local answer
+  printf '%s [Y/n]: ' "$prompt"
+  IFS= read -r answer || return 1
+  [[ -z "$answer" || "$answer" == "y" || "$answer" == "Y" ]]
+}
+
+confirm_phrase() {
+  local prompt="$1"
+  local phrase="$2"
+  local answer
+  printf '%s\n请输入 %s 继续: ' "$prompt" "$phrase"
+  IFS= read -r answer || return 1
+  [[ "$answer" == "$phrase" ]]
+}
+
+render_command() {
+  local rendered=""
+  local argument
+  for argument in "$@"; do
+    printf -v argument '%q' "$argument"
+    rendered+="${argument} "
+  done
+  printf '%s' "${rendered% }"
+}
+
+run_cmd() {
+  local rendered
+  rendered="$(render_command "$@")"
+  if (( DRY_RUN )); then
+    printf '%s[预览]%s %s\n' "$C_YELLOW" "$C_RESET" "$rendered"
+    return 0
+  fi
+
+  log_event COMMAND "$rendered"
+  local rc
+  if [[ -n "$LOG_FILE" ]] && command -v tee >/dev/null 2>&1; then
+    "$@" 2>&1 | tee -a "$LOG_FILE"
+    rc=${PIPESTATUS[0]}
+  else
+    "$@"
+    rc=$?
+  fi
+  (( rc == 0 )) && return 0
+
+  error "命令执行失败，退出码 ${rc}: ${rendered}"
+  return "$rc"
+}
+
+cleanup_temp_dir() {
+  [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]] || return 0
+  local temp_base="${TMPDIR:-/tmp}"
+  case "$TEMP_DIR" in
+    "$temp_base"/vps-init.*)
+      if ! rm -rf -- "$TEMP_DIR"; then
+        warn "无法清理临时目录: ${TEMP_DIR}"
+        return 1
+      fi
+      ;;
+    *)
+      warn "拒绝清理未验证的临时目录: ${TEMP_DIR}"
+      return 1
+      ;;
+  esac
+  TEMP_DIR=""
+}
+
+new_temp_file() {
+  local prefix="${1:-file}"
+  local temp_base="${TEMP_DIR:-${TMPDIR:-/tmp}}"
+  mktemp "${temp_base}/${prefix}.XXXXXX"
+}
+
+set_transaction_status() {
+  local status="$1"
+  (( DRY_RUN )) && return 0
+  [[ -n "$TRANSACTION_STATUS_FILE" ]] || return 0
+  local temp_status="${TRANSACTION_STATUS_FILE}.tmp.$$"
+  if ! printf '%s\n' "$status" >"$temp_status" || ! chmod 600 "$temp_status" || \
+     ! mv -f -- "$temp_status" "$TRANSACTION_STATUS_FILE"; then
+    rm -f -- "$temp_status" 2>/dev/null || true
+    error "无法记录事务状态: ${status}"
+    MANUAL_RECOVERY_REQUIRED=1
+    return 1
+  fi
+  TRANSACTION_STATUS="$status"
+}
+
+mark_transaction_staged() {
+  (( TRANSACTION_ACTIVE )) || return 0
+  [[ "$TRANSACTION_STATUS" == "STAGED" ]] && return 0
+  set_transaction_status STAGED
+}
+
+commit_transaction() {
+  (( TRANSACTION_ACTIVE )) || return 0
+  set_transaction_status COMMITTED || return 1
+  TRANSACTION_ACTIVE=0
+  TRANSACTION_ROLLBACK_HANDLER=""
+}
+
+mark_manual_recovery() {
+  local reason="$1"
+  warn "$reason"
+  log_event MANUAL_RECOVERY "$reason"
+  MANUAL_RECOVERY_REQUIRED=1
+  set_transaction_status MANUAL_RECOVERY_REQUIRED || true
+  TRANSACTION_ACTIVE=0
+  TRANSACTION_ROLLBACK_HANDLER=""
+}
+
+setup_runtime_dirs() {
+  if (( DRY_RUN )); then
+    TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vps-init.XXXXXX")" || {
+      error "无法创建临时目录"
+      return 1
+    }
+    chmod 700 -- "$TEMP_DIR" || return 1
+    return 0
+  fi
+  if ! mkdir -p -- "$LOG_ROOT" "$BACKUP_ROOT"; then
+    error "无法创建日志或备份目录"
+    return 1
+  fi
+  if ! chmod 700 -- "$LOG_ROOT" "$BACKUP_ROOT"; then
+    error "无法设置日志或备份目录权限"
+    return 1
+  fi
+  LOG_FILE="${LOG_ROOT}/${RUN_ID}.log"
+  if ! : >"$LOG_FILE" || ! chmod 600 -- "$LOG_FILE"; then
+    error "无法创建运行日志: ${LOG_FILE}"
+    return 1
+  fi
+  TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vps-init.XXXXXX")" || {
+    error "无法创建临时目录"
+    return 1
+  }
+  if ! chmod 700 -- "$TEMP_DIR"; then
+    error "无法设置临时目录权限"
+    cleanup_temp_dir || true
+    return 1
+  fi
+  log_event INFO "启动 ${SCRIPT_NAME} ${SCRIPT_VERSION}"
+  info "运行日志: ${LOG_FILE}"
+}
+
+start_backup_batch() {
+  local label="$1"
+  local rollback_handler="${2:-rollback_current_batch}"
+  (( DRY_RUN )) && return 0
+  ((BACKUP_SEQUENCE += 1))
+  label="${label//[^a-zA-Z0-9_-]/-}"
+  BACKUP_DIR="${BACKUP_ROOT}/${RUN_ID}-${BACKUP_SEQUENCE}-${label}"
+  BACKED_UP=()
+  ORIGINAL_STATE=()
+  ORIGINAL_HASH=()
+  if ! mkdir -p -- "$BACKUP_DIR/files" || ! chmod 700 -- "$BACKUP_DIR" "$BACKUP_DIR/files"; then
+    error "无法创建备份批次: ${BACKUP_DIR}"
+    return 1
+  fi
+  if ! printf '# vps-init backup manifest v2\n' >"${BACKUP_DIR}/manifest.tsv" || \
+     ! chmod 600 -- "${BACKUP_DIR}/manifest.tsv"; then
+    error "无法创建备份清单: ${BACKUP_DIR}/manifest.tsv"
+    return 1
+  fi
+  TRANSACTION_ACTIVE=1
+  TRANSACTION_ROLLBACK_HANDLER="$rollback_handler"
+  TRANSACTION_STATUS_FILE="${BACKUP_DIR}/transaction.status"
+  TRANSACTION_STATUS=""
+  set_transaction_status PREPARED || return 1
+  log_event INFO "创建备份批次 ${BACKUP_DIR##*/}"
+  info "备份批次: ${BACKUP_DIR##*/}"
+}
+
+record_metadata() {
+  local key="$1"
+  local value="$2"
+  (( DRY_RUN )) && return 0
+  if [[ "$key" == *$'\t'* || "$key" == *$'\n'* || "$value" == *$'\t'* || "$value" == *$'\n'* ]]; then
+    error "事务元数据包含非法字符"
+    return 1
+  fi
+  printf 'META\t%s\t%s\t-\n' "$key" "$value" >>"${BACKUP_DIR}/manifest.tsv" || {
+    error "无法写入事务元数据: ${key}"
+    return 1
+  }
+}
+
+check_pending_transactions() {
+  local status_file status batch found=0
+  local -a pending=()
+  while IFS= read -r status_file; do
+    status="$(head -n 1 "$status_file" 2>/dev/null || true)"
+    case "$status" in
+      PREPARED|STAGED|MANUAL_RECOVERY_REQUIRED)
+        batch="$(basename -- "$(dirname -- "$status_file")")"
+        pending+=("${batch}:${status}")
+        found=1
+        ;;
+    esac
+  done < <(find "$BACKUP_ROOT" -mindepth 2 -maxdepth 2 -type f -name transaction.status 2>/dev/null)
+
+  (( found )) || return 0
+  heading "发现未完成事务"
+  printf '  %s\n' "${pending[@]}"
+  warn "请先核对对应备份和日志，脚本不会自动回滚"
+  confirm_phrase "确认了解风险后继续进入菜单" "CONTINUE" || return 1
+}
+
+load_os_info() {
+  if [[ ! -r /etc/os-release ]]; then
+    error "无法读取 /etc/os-release"
+    return 1
+  fi
+
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  OS_ID="${ID:-}"
+  OS_NAME="${PRETTY_NAME:-${ID:-unknown}}"
+
+  case "$OS_ID" in
+    debian|ubuntu) ;;
+    *)
+      error "当前系统不受支持: ${OS_NAME}"
+      return 1
+      ;;
+  esac
+}
+
+preflight() {
+  if (( EUID != 0 )); then
+    error "请使用 root 权限运行脚本，例如 sudo bash ${SCRIPT_NAME}"
+    return 1
+  fi
+
+  load_os_info || return 1
+
+  local command_name
+  for command_name in apt-get systemctl awk sed grep install sha256sum cmp readlink ln; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+      error "缺少基础命令: ${command_name}"
+      return 1
+    fi
+  done
+
+  if [[ ! -d /run/systemd/system ]]; then
+    error "当前系统未使用 systemd"
+    return 1
+  fi
+
+  return 0
+}
+
+path_state() {
+  local path="$1"
+  if [[ -e "$path" || -L "$path" ]]; then
+    printf 'present'
+  else
+    printf 'absent'
+  fi
+}
+
+path_hash() {
+  local path="$1"
+  if [[ -f "$path" ]]; then
+    sha256sum -- "$path" | awk '{print $1}'
+  elif [[ -L "$path" ]]; then
+    printf 'symlink:%s' "$(readlink -- "$path")"
+  else
+    printf '-'
+  fi
+}
+
+backup_file() {
+  local path="$1"
+  (( DRY_RUN )) && return 0
+
+  if [[ -z "$BACKUP_DIR" ]]; then
+    error "内部错误：写入前没有创建备份批次"
+    return 1
+  fi
+
+  if [[ -n "${BACKED_UP[$path]+x}" ]]; then
+    return 0
+  fi
+
+  local state hash destination
+  state="$(path_state "$path")" || {
+    error "无法读取文件状态: ${path}"
+    return 1
+  }
+  hash="$(path_hash "$path")" || {
+    error "无法计算文件摘要: ${path}"
+    return 1
+  }
+  destination="${BACKUP_DIR}/files${path}"
+  if ! mkdir -p -- "$(dirname -- "$destination")"; then
+    error "无法创建备份目录: $(dirname -- "$destination")"
+    return 1
+  fi
+
+  if [[ "$state" == "present" ]]; then
+    if ! cp -a -- "$path" "$destination"; then
+      error "无法备份文件: ${path}"
+      return 1
+    fi
+  fi
+
+  if ! printf 'BEFORE\t%s\t%s\t%s\n' "$path" "$state" "$hash" >>"${BACKUP_DIR}/manifest.tsv"; then
+    error "无法写入备份清单: ${path}"
+    return 1
+  fi
+  BACKED_UP["$path"]=1
+  ORIGINAL_STATE["$path"]="$state"
+  ORIGINAL_HASH["$path"]="$hash"
+  log_event INFO "已备份 ${path}"
+}
+
+record_after_file() {
+  local path="$1"
+  (( DRY_RUN )) && return 0
+  local state hash
+  state="$(path_state "$path")" || return 1
+  hash="$(path_hash "$path")" || return 1
+  printf 'AFTER\t%s\t%s\t%s\n' "$path" "$state" "$hash" >>"${BACKUP_DIR}/manifest.tsv" || {
+    error "无法记录修改后摘要: ${path}"
+    return 1
+  }
+}
+
+restore_file_from_current_run() {
+  local path="$1"
+  (( DRY_RUN )) && return 0
+  [[ -n "${BACKED_UP[$path]+x}" ]] || return 0
+
+  local destination="${BACKUP_DIR}/files${path}"
+  if [[ "${ORIGINAL_STATE[$path]}" == "present" ]]; then
+    if ! mkdir -p -- "$(dirname -- "$path")" || ! cp -a -- "$destination" "$path"; then
+      error "无法恢复文件: ${path}"
+      return 1
+    fi
+  else
+    if ! rm -f -- "$path"; then
+      error "无法删除本次新增文件: ${path}"
+      return 1
+    fi
+  fi
+  log_event WARN "已恢复 ${path}"
+}
+
+managed_file_owned() {
+  local path="$1"
+  [[ -f "$path" ]] || return 1
+  grep -Fqx "$MANAGED_HEADER" "$path" || grep -Fqx "$LEGACY_MANAGED_HEADER" "$path"
+}
+
+write_managed_file() {
+  local target="$1"
+  local mode="$2"
+  local content="$3"
+
+  if [[ -L "$target" ]]; then
+    error "目标是符号链接，拒绝覆盖: ${target}"
+    return 1
+  fi
+  if [[ -e "$target" ]] && ! managed_file_owned "$target"; then
+    error "${target} 已存在且不属于本脚本，停止覆盖"
+    return 1
+  fi
+
+  if [[ -e "$target" ]] && [[ "$(cat -- "$target")" == "$content" ]]; then
+    info "配置没有变化: ${target}"
+    return 0
+  fi
+
+  if (( DRY_RUN )); then
+    printf '%s[预览]%s 写入 %s\n' "$C_YELLOW" "$C_RESET" "$target"
+    printf '%s\n' "$content"
+    return 0
+  fi
+
+  local temp_file
+  temp_file="$(new_temp_file managed)" || {
+    error "无法创建临时配置文件"
+    return 1
+  }
+  if ! printf '%s\n' "$content" >"$temp_file" || ! chmod "$mode" "$temp_file"; then
+    rm -f -- "$temp_file" 2>/dev/null || true
+    error "无法准备临时配置: ${target}"
+    return 1
+  fi
+  backup_file "$target" || {
+    rm -f -- "$temp_file" 2>/dev/null || true
+    return 1
+  }
+  if ! mkdir -p -- "$(dirname -- "$target")"; then
+    rm -f -- "$temp_file" 2>/dev/null || true
+    error "无法创建目标目录: $(dirname -- "$target")"
+    return 1
+  fi
+  mark_transaction_staged || {
+    rm -f -- "$temp_file" 2>/dev/null || true
+    return 1
+  }
+  if ! install -m "$mode" -- "$temp_file" "$target"; then
+    rm -f -- "$temp_file" 2>/dev/null || true
+    error "无法写入 ${target}"
+    return 1
+  fi
+  if ! rm -f -- "$temp_file"; then
+    warn "无法清理临时文件: ${temp_file}"
+  fi
+  record_after_file "$target" || return 1
+  return 0
+}
+
+valid_port() {
+  local port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 ))
+}
+
+valid_high_port() {
+  local port="$1"
+  valid_port "$port" && (( 10#$port >= 20000 ))
+}
+
+parse_port_list() {
+  local input="${1//[[:space:]]/}"
+  local token start end normalized
+  local -A seen=()
+  local -A covered_ports=()
+  local -a tokens=()
+  local current
+  PARSED_PORTS=()
+  PARSED_PORT_TOTAL=0
+
+  [[ -n "$input" ]] || return 1
+  IFS=',' read -r -a tokens <<<"$input"
+  ((${#tokens[@]} > 0)) || return 1
+
+  for token in "${tokens[@]}"; do
+    if [[ "$token" =~ ^([0-9]+)$ ]]; then
+      start="${BASH_REMATCH[1]}"
+      valid_port "$start" || return 1
+      normalized="$((10#$start))"
+    elif [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      start="${BASH_REMATCH[1]}"
+      end="${BASH_REMATCH[2]}"
+      valid_port "$start" && valid_port "$end" || return 1
+      (( 10#$start <= 10#$end )) || return 1
+      normalized="$((10#$start)):$((10#$end))"
+    else
+      return 1
+    fi
+
+    if [[ -z "${seen[$normalized]+x}" ]]; then
+      seen["$normalized"]=1
+      PARSED_PORTS+=("$normalized")
+      if [[ "$normalized" == *:* ]]; then
+        start="${normalized%:*}"
+        end="${normalized#*:}"
+        for ((current=start; current<=end; current++)); do
+          if [[ -z "${covered_ports[$current]+x}" ]]; then
+            covered_ports["$current"]=1
+            ((PARSED_PORT_TOTAL += 1))
+          fi
+        done
+      else
+        if [[ -z "${covered_ports[$normalized]+x}" ]]; then
+          covered_ports["$normalized"]=1
+          ((PARSED_PORT_TOTAL += 1))
+        fi
+      fi
+    fi
+  done
+}
+
+valid_duration() {
+  [[ "$1" =~ ^[1-9][0-9]*[smhdw]?$ ]]
+}
+
+valid_ipv4() {
+  local address="$1"
+  local prefix=""
+  local octet
+  local -a octets=()
+
+  if [[ "$address" == */* ]]; then
+    prefix="${address#*/}"
+    address="${address%/*}"
+    [[ "$prefix" =~ ^[0-9]+$ ]] && (( 10#$prefix <= 32 )) || return 1
+  fi
+
+  IFS='.' read -r -a octets <<<"$address"
+  ((${#octets[@]} == 4)) || return 1
+  for octet in "${octets[@]}"; do
+    [[ "$octet" =~ ^[0-9]+$ ]] && (( 10#$octet <= 255 )) || return 1
+  done
+}
+
+valid_ipv6() {
+  local address="$1"
+  local prefix=""
+  local left right group
+  local group_count=0
+  local compressed=0
+  local -a groups=()
+  if [[ "$address" == */* ]]; then
+    prefix="${address#*/}"
+    address="${address%/*}"
+    [[ "$prefix" =~ ^[0-9]+$ ]] && (( 10#$prefix <= 128 )) || return 1
+  fi
+  [[ "$address" == *:* && "$address" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+  [[ "$address" != *:::* ]] || return 1
+  [[ "$address" != :* || "$address" == ::* ]] || return 1
+  [[ "$address" != *: || "$address" == *:: ]] || return 1
+
+  if [[ "$address" == *::* ]]; then
+    compressed=1
+    left="${address%%::*}"
+    right="${address#*::}"
+    [[ "$right" != *::* ]] || return 1
+    if [[ -n "$left" ]]; then
+      IFS=':' read -r -a groups <<<"$left"
+      for group in "${groups[@]}"; do
+        [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        ((group_count += 1))
+      done
+    fi
+    if [[ -n "$right" ]]; then
+      IFS=':' read -r -a groups <<<"$right"
+      for group in "${groups[@]}"; do
+        [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        ((group_count += 1))
+      done
+    fi
+  else
+    IFS=':' read -r -a groups <<<"$address"
+    for group in "${groups[@]}"; do
+      [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+      ((group_count += 1))
+    done
+  fi
+
+  if (( compressed )); then
+    (( group_count < 8 ))
+  else
+    (( group_count == 8 ))
+  fi
+}
+
+valid_ip_or_cidr() {
+  valid_ipv4 "$1" || valid_ipv6 "$1"
+}
+
+package_installed() {
+  dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null | grep -q '^ii '
+}
+
+apt_lock_busy() {
+  local lock
+  for lock in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock; do
+    [[ -e "$lock" ]] || continue
+    if command -v fuser >/dev/null 2>&1 && fuser "$lock" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+show_help() {
+  cat <<'EOF'
+用法:
+  ini
+  ini --dry-run
+  ini --check
+  ini --restore <备份批次>
+  sudo bash leeye-init
+  bash leeye-init --help
+
+脚本通过菜单一次执行一个优化模块，不提供一键初始化
+EOF
+}
+
+shortcut_ready() {
+  local source_path
+  [[ -x "$INSTALL_PATH" && -L "$SHORTCUT_PATH" ]] || return 1
+  [[ "$(readlink -f "$SHORTCUT_PATH" 2>/dev/null)" == "$INSTALL_PATH" ]] || return 1
+  source_path="$(readlink -f "${BASH_SOURCE[0]}")" || return 1
+  [[ "$source_path" == "$INSTALL_PATH" ]] || cmp -s -- "$source_path" "$INSTALL_PATH"
+}
+
+install_shortcut() {
+  shortcut_ready && return 0
+  local source_path temp_install
+  source_path="$(readlink -f "${BASH_SOURCE[0]}")" || return 1
+
+  if [[ -e "$INSTALL_PATH" ]] && \
+     ! grep -Fq 'readonly SCRIPT_NAME="leeye-init"' "$INSTALL_PATH"; then
+    error "${INSTALL_PATH} 已存在且不属于 LeeYe Init"
+    return 1
+  fi
+  if [[ -e "$SHORTCUT_PATH" || -L "$SHORTCUT_PATH" ]]; then
+    if [[ ! -L "$SHORTCUT_PATH" || "$(readlink -f "$SHORTCUT_PATH" 2>/dev/null)" != "$INSTALL_PATH" ]]; then
+      error "${SHORTCUT_PATH} 已被其他命令占用"
+      return 1
+    fi
+  fi
+
+  if (( DRY_RUN )); then
+    printf '%s[预览]%s 安装 %s 并创建 ini 快捷命令\n' "$C_YELLOW" "$C_RESET" "$INSTALL_PATH"
+    return 0
+  fi
+  confirm_default_yes "安装 ini 快捷命令，方便下次直接启动" || {
+    warn "未安装 ini 快捷命令，下次仍需通过脚本路径启动"
+    return 0
+  }
+
+  temp_install="${TEMP_DIR}/leeye-init.install"
+  if [[ "$source_path" != "$INSTALL_PATH" ]]; then
+    if ! install -m 755 -o root -g root "$source_path" "$temp_install" || \
+       ! mv -f -- "$temp_install" "$INSTALL_PATH"; then
+      rm -f -- "$temp_install" 2>/dev/null || true
+      error "无法安装 ${INSTALL_PATH}"
+      return 1
+    fi
+  fi
+  if ! ln -sfn "$INSTALL_PATH" "$SHORTCUT_PATH"; then
+    error "无法创建 ini 快捷命令"
+    return 1
+  fi
+  success "快捷命令已安装，下次输入 ini 即可启动"
+}
+
+apt_ready() {
+  if apt_lock_busy; then
+    error "APT 或 dpkg 正被其他进程占用，请稍后重试"
+    return 1
+  fi
+}
+
+apt_available_mib() {
+  local path="$1"
+  df -Pm "$path" 2>/dev/null | awk 'NR == 2 {print $4}'
+}
+
+apt_disk_preflight() {
+  local operation="$1"
+  local path available min_available=""
+  local -a paths=(/var/cache/apt/archives /var/lib/dpkg /)
+  local -A seen_fs=()
+
+  heading "APT 磁盘预检"
+  for path in "${paths[@]}"; do
+    [[ -e "$path" ]] || path="$(dirname -- "$path")"
+    local filesystem
+    filesystem="$(df -P "$path" 2>/dev/null | awk 'NR == 2 {print $1}')"
+    [[ -n "$filesystem" && -z "${seen_fs[$filesystem]+x}" ]] || continue
+    seen_fs["$filesystem"]=1
+    available="$(apt_available_mib "$path")"
+    [[ "$available" =~ ^[0-9]+$ ]] || {
+      error "无法读取 ${path} 的可用空间"
+      return 1
+    }
+    printf '%s: %s MiB 可用\n' "$path" "$available"
+    if [[ -z "$min_available" ]] || (( available < min_available )); then
+      min_available="$available"
+    fi
+  done
+
+  [[ "$min_available" =~ ^[0-9]+$ ]] || return 1
+  if (( min_available < 256 )); then
+    error "APT 所在文件系统最少只有 ${min_available} MiB 可用，拒绝执行 ${operation}"
+    return 1
+  fi
+  if (( min_available < 1024 )); then
+    warn "APT 所在文件系统最少只有 ${min_available} MiB 可用"
+    confirm "确认继续 ${operation}" || return 1
+  fi
+}
+
+apt_simulate() {
+  local operation="$1"
+  shift
+  if ! env LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTIONS[@]}" -s "$@" >/dev/null; then
+    error "APT 模拟执行失败: ${operation}"
+    return 1
+  fi
+}
+
+apt_extract_package_section() {
+  local header="$1"
+  awk -v header="$header" '
+    $0 == header { capture=1; next }
+    capture && /^  / {
+      for (i=1; i<=NF; i++) print $i
+      next
+    }
+    capture { exit }
+  '
+}
+
+apt_upgrade_new_dependencies() {
+  env LC_ALL=C DEBIAN_FRONTEND=noninteractive \
+    apt-get "${APT_OPTIONS[@]}" -s --with-new-pkgs upgrade 2>/dev/null |
+    apt_extract_package_section 'The following NEW packages will be installed:'
+}
+
+apt_upgrade_kept_back() {
+  env LC_ALL=C DEBIAN_FRONTEND=noninteractive \
+    apt-get "${APT_OPTIONS[@]}" -s upgrade 2>/dev/null |
+    apt_extract_package_section 'The following packages have been kept back:'
+}
+
+show_apt_upgrade_notes() {
+  local -a new_dependencies=()
+  local -a kept_back=()
+  mapfile -t new_dependencies < <(apt_upgrade_new_dependencies)
+  mapfile -t kept_back < <(apt_upgrade_kept_back)
+
+  if ((${#new_dependencies[@]} > 0)); then
+    printf '\n%s需要新增依赖才能升级%s\n' "$C_YELLOW" "$C_RESET"
+    printf '普通 apt-get upgrade 不会安装以下依赖:\n'
+    log_event WARN "检测到 ${#new_dependencies[@]} 个升级所需新增依赖"
+    printf '  %s\n' "${new_dependencies[@]}"
+  fi
+  if ((${#kept_back[@]} > 0)); then
+    printf '\n普通升级将保留以下软件包:\n'
+    log_event INFO "普通升级将保留 ${#kept_back[@]} 个软件包"
+    printf '  %s\n' "${kept_back[@]}"
+  fi
+}
+
+apt_update_index() {
+  apt_ready || return 1
+  apt_disk_preflight "刷新软件包索引" || return 1
+  run_cmd apt-get "${APT_OPTIONS[@]}" update
+}
+
+install_package_preset() {
+  local preset="$1"
+  local -a requested=("${NECESSARY_PACKAGES[@]}")
+  local -a missing=()
+  local package_name
+
+  if [[ "$preset" == "full" ]]; then
+    requested+=("${FULL_EXTRA_PACKAGES[@]}")
+  fi
+
+  for package_name in "${requested[@]}"; do
+    if ! package_installed "$package_name"; then
+      missing+=("$package_name")
+    fi
+  done
+
+  heading "安装计划"
+  printf '环境预设: %s\n' "$([[ "$preset" == "full" ]] && printf '全能环境' || printf '必要环境')"
+  printf '软件包: %s\n' "${requested[*]}"
+
+  if ((${#missing[@]} == 0)); then
+    success "所选环境已经安装完整"
+    return 0
+  fi
+
+  printf '需要安装: %s\n' "${missing[*]}"
+  warn "软件包安装和依赖变更无法由配置备份恢复"
+  confirm "确认刷新软件包索引并安装以上软件包" || {
+    info "已取消环境安装"
+    return 0
+  }
+
+  apt_update_index || return 1
+  apt_simulate "安装环境" install --no-install-recommends "${missing[@]}" || return 1
+  run_cmd env DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTIONS[@]}" install -y --no-install-recommends "${missing[@]}" || return 1
+
+  if (( DRY_RUN )); then
+    info "预览完成，未安装软件包"
+    return 0
+  fi
+
+  local failed=0
+  for package_name in "${missing[@]}"; do
+    if ! package_installed "$package_name"; then
+      error "软件包未正确安装: ${package_name}"
+      failed=1
+    fi
+  done
+  (( failed == 0 )) || return 1
+  success "环境安装完成"
+}
+
+update_system_packages() {
+  heading "系统更新计划"
+  printf '系统: %s\n' "$OS_NAME"
+  printf '操作: apt-get update + apt-get upgrade -y\n'
+  warn "系统更新不会执行 full-upgrade、自动删除软件包或自动重启"
+  warn "软件包升级无法由配置备份恢复"
+  confirm "确认更新系统" || {
+    info "已取消系统更新"
+    return 0
+  }
+
+  apt_update_index || return 1
+  apt_simulate "更新系统" upgrade || return 1
+  show_apt_upgrade_notes
+  run_cmd env DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTIONS[@]}" upgrade -y || return 1
+
+  if (( DRY_RUN )); then
+    info "预览完成，未更新系统"
+  elif [[ -e /var/run/reboot-required ]]; then
+    warn "系统更新完成，需要重启才能应用部分更新，本脚本不会自动重启"
+  else
+    success "系统更新完成"
+  fi
+}
+
+module_environment() {
+  local choice
+  while true; do
+    heading "系统更新与环境安装"
+    print_spaced_menu \
+      "1. 系统更新" \
+      "2. 安装必要环境" \
+      "3. 安装全能环境" \
+      "0. 返回主菜单"
+    printf '请选择: '
+    IFS= read -r choice || return 0
+    case "$choice" in
+      1) update_system_packages; return $? ;;
+      2) install_package_preset necessary; return $? ;;
+      3) install_package_preset full; return $? ;;
+      0) return 0 ;;
+      *) warn "无效选项，请重新输入" ;;
+    esac
+  done
+}
+
+sshd_command() {
+  if command -v sshd >/dev/null 2>&1; then
+    command -v sshd
+  elif [[ -x /usr/sbin/sshd ]]; then
+    printf '/usr/sbin/sshd'
+  else
+    return 1
+  fi
+}
+
+effective_ssh_ports() {
+  local daemon
+  daemon="$(sshd_command)" || return 1
+  local output
+  output="$("$daemon" -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -nu)"
+  if [[ -n "$output" ]]; then
+    printf '%s\n' "$output"
+  elif [[ -n "${SSH_CONNECTION:-}" ]]; then
+    awk '{print $4}' <<<"$SSH_CONNECTION"
+  else
+    printf '22\n'
+  fi
+}
+
+ufw_installed() {
+  command -v ufw >/dev/null 2>&1 && package_installed ufw
+}
+
+ufw_active() {
+  LANG=C ufw status 2>/dev/null | grep -q '^Status: active$'
+}
+
+ufw_ipv6_enabled() {
+  grep -Eiq '^[[:space:]]*IPV6=yes([[:space:]]|$)' /etc/default/ufw 2>/dev/null
+}
+
+ufw_rule_exists_v4() {
+  local rule="$1"
+  LANG=C ufw status 2>/dev/null | awk -v wanted="$rule" '
+    $1 == wanted && $2 == "ALLOW" { found=1 }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+ufw_rule_exists_v6() {
+  local rule="$1"
+  LANG=C ufw status 2>/dev/null | awk -v wanted="$rule" '
+    $1 == wanted && $2 == "(v6)" && $3 == "ALLOW" { found=1 }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+ufw_rule_exists() {
+  local rule="$1"
+  if ! ufw_active; then
+    ufw_saved_rule_exists "$rule"
+    return $?
+  fi
+  ufw_rule_exists_v4 "$rule" || return 1
+  if ufw_ipv6_enabled; then
+    ufw_rule_exists_v6 "$rule" || return 1
+  fi
+}
+
+ufw_saved_rule_exists() {
+  local rule="$1"
+  LANG=C ufw show added 2>/dev/null | awk -v wanted="$rule" '
+    $1 == "ufw" && $2 == "allow" && $3 == wanted { found=1 }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+backup_ufw_files() {
+  local path
+  local active=0 ipv6=0
+  ufw_active && active=1
+  ufw_ipv6_enabled && ipv6=1
+  record_metadata ufw_active "$active" || return 1
+  record_metadata ufw_ipv6 "$ipv6" || return 1
+  for path in /etc/ufw/user.rules /etc/ufw/user6.rules /etc/ufw/ufw.conf /etc/default/ufw; do
+    backup_file "$path" || return 1
+  done
+}
+
+record_ufw_files() {
+  local path
+  for path in /etc/ufw/user.rules /etc/ufw/user6.rules /etc/ufw/ufw.conf /etc/default/ufw; do
+    record_after_file "$path" || return 1
+  done
+}
+
+rollback_ufw_files() {
+  rollback_current_batch || return 1
+  if ! ufw reload >/dev/null 2>&1; then
+    mark_manual_recovery "UFW 文件已恢复，但重新加载失败"
+    return 1
+  fi
+}
+
+add_ufw_rules() {
+  local input protocol_choice
+  local -a protocols=()
+  local -a planned=()
+  local item protocol rule
+
+  printf '输入端口，支持 443、80,443、30000-30100，输入 0 返回: '
+  IFS= read -r input || return 0
+  [[ "$input" != "0" ]] || return 0
+
+  if ! parse_port_list "$input"; then
+    error "端口格式错误，允许范围为 1-65535"
+    return 1
+  fi
+
+  print_spaced_menu \
+    "1. TCP" \
+    "2. UDP" \
+    "3. TCP 和 UDP" \
+    "0. 返回主菜单"
+  printf '请选择协议: '
+  IFS= read -r protocol_choice || return 0
+  case "$protocol_choice" in
+    1) protocols=(tcp) ;;
+    2) protocols=(udp) ;;
+    3) protocols=(tcp udp) ;;
+    0) return 0 ;;
+    *) error "协议选项无效"; return 1 ;;
+  esac
+
+  for item in "${PARSED_PORTS[@]}"; do
+    for protocol in "${protocols[@]}"; do
+      rule="${item}/${protocol}"
+      if ufw_rule_exists "$rule"; then
+        info "规则已存在，跳过 ${rule}"
+      else
+        planned+=("$rule")
+      fi
+    done
+  done
+
+  if ((${#planned[@]} == 0)); then
+    success "没有需要添加的规则"
+    return 0
+  fi
+
+  heading "防火墙修改计划"
+  printf '添加 ALLOW 规则: %s\n' "${planned[*]}"
+  printf '覆盖端口数量: %s，每个所选协议分别应用\n' "$PARSED_PORT_TOTAL"
+  confirm "确认添加以上规则" || {
+    info "已取消添加规则"
+    return 0
+  }
+
+  start_backup_batch ufw-add rollback_ufw_files || return 1
+  backup_ufw_files || return 1
+  mark_transaction_staged || return 1
+  for rule in "${planned[@]}"; do
+    if ! run_cmd ufw allow "$rule" comment leeye-init; then
+      (( DRY_RUN )) || rollback_ufw_files
+      return 1
+    fi
+  done
+  record_ufw_files || return 1
+  if (( DRY_RUN )); then
+    info "预览完成，未添加规则"
+  else
+    for rule in "${planned[@]}"; do
+      if ufw_active && ! ufw_rule_exists "$rule"; then
+        error "规则未在全部启用地址族中生效: ${rule}"
+        rollback_ufw_files || true
+        return 1
+      fi
+    done
+    commit_transaction || return 1
+    success "防火墙规则已添加"
+  fi
+}
+
+delete_ufw_rule() {
+  local number selected_line rule_spec paired_delete=0
+  heading "当前 UFW 规则"
+  show_ufw_numbered
+  printf '输入要删除的规则编号，输入 0 返回: '
+  IFS= read -r number || return 0
+  [[ "$number" != "0" ]] || return 0
+
+  if [[ ! "$number" =~ ^[1-9][0-9]*$ ]] || \
+     ! LANG=C ufw status numbered | grep -Eq "^\\[[[:space:]]*${number}\\]"; then
+    error "规则编号不存在"
+    return 1
+  fi
+
+  selected_line="$(LANG=C ufw status numbered | sed -n -E "s/^\\[[[:space:]]*${number}\\][[:space:]]*//p" | head -n 1)"
+  rule_spec="$(awk '{print $1}' <<<"$selected_line")"
+  if [[ "$rule_spec" =~ ^[0-9]+(:[0-9]+)?/(tcp|udp)$ ]] && ufw_ipv6_enabled; then
+    if confirm "是否同时删除 ${rule_spec} 的 IPv4 和 IPv6 配对规则"; then
+      paired_delete=1
+    fi
+  fi
+
+  warn "删除 UFW 规则可能中断依赖该端口的连接"
+  confirm "确认删除规则 ${number}" || {
+    info "已取消删除规则"
+    return 0
+  }
+
+  start_backup_batch ufw-delete rollback_ufw_files || return 1
+  backup_ufw_files || return 1
+  mark_transaction_staged || return 1
+  if (( paired_delete )); then
+    if ! run_cmd ufw delete allow "$rule_spec"; then
+      (( DRY_RUN )) || rollback_ufw_files
+      return 1
+    fi
+  elif ! run_cmd ufw --force delete "$number"; then
+    (( DRY_RUN )) || rollback_ufw_files
+    return 1
+  fi
+  record_ufw_files || return 1
+  if (( DRY_RUN )); then
+    info "预览完成，未删除规则"
+  else
+    commit_transaction || return 1
+    success "规则已删除"
+  fi
+}
+
+enable_ufw() {
+  local -a ssh_ports=()
+  local -a missing_rules=()
+  local port
+  local set_defaults=0
+
+  mapfile -t ssh_ports < <(effective_ssh_ports) || {
+    error "无法读取 SSH 有效端口，拒绝启用 UFW"
+    return 1
+  }
+
+  for port in "${ssh_ports[@]}"; do
+    valid_port "$port" || continue
+    if ! ufw_rule_exists "${port}/tcp"; then
+      missing_rules+=("${port}/tcp")
+    fi
+  done
+
+  heading "启用 UFW"
+  printf '当前 SSH 端口: %s\n' "${ssh_ports[*]}"
+  if ((${#missing_rules[@]} > 0)); then
+    warn "以下 SSH 端口尚未放行: ${missing_rules[*]}"
+    confirm "是否先添加这些 SSH 放行规则" || {
+      error "为避免 SSH 失联，本次不启用 UFW"
+      return 1
+    }
+  fi
+
+  if ! ufw_active; then
+    if confirm "是否设置入站默认拒绝、出站默认允许"; then
+      set_defaults=1
+    fi
+  fi
+
+  warn "请确认云厂商安全组已放行当前 SSH 端口"
+  confirm_phrase "启用防火墙前请保持当前 SSH 会话连接" "ENABLE UFW" || {
+    info "已取消启用 UFW"
+    return 0
+  }
+
+  start_backup_batch ufw-enable rollback_ufw_files || return 1
+  backup_ufw_files || return 1
+  mark_transaction_staged || return 1
+  for port in "${missing_rules[@]}"; do
+    if ! run_cmd ufw allow "$port" comment leeye-init-ssh; then
+      (( DRY_RUN )) || rollback_ufw_files
+      return 1
+    fi
+  done
+
+  if (( set_defaults )); then
+    run_cmd ufw default deny incoming || {
+      (( DRY_RUN )) || rollback_ufw_files
+      return 1
+    }
+    run_cmd ufw default allow outgoing || {
+      (( DRY_RUN )) || rollback_ufw_files
+      return 1
+    }
+  fi
+
+  if ! run_cmd ufw --force enable; then
+    (( DRY_RUN )) || rollback_ufw_files
+    return 1
+  fi
+  record_ufw_files || return 1
+
+  if (( DRY_RUN )); then
+    info "预览完成，未启用 UFW"
+  elif ufw_active; then
+    for port in "${ssh_ports[@]}"; do
+      if ! ufw_rule_exists "${port}/tcp"; then
+        error "UFW 启用后未在全部地址族放行 SSH 端口 ${port}"
+        rollback_ufw_files || true
+        return 1
+      fi
+    done
+    commit_transaction || return 1
+    success "UFW 已启用"
+    LANG=C ufw status verbose
+  else
+    error "UFW 未进入启用状态"
+    return 1
+  fi
+}
+
+module_firewall() {
+  local choice
+  heading "防火墙"
+  if ! ufw_installed; then
+    warn "尚未安装 UFW，请先通过选项 1 安装必要环境或全能环境"
+    return 0
+  fi
+
+  LANG=C ufw status verbose
+  printf '\n'
+  print_spaced_menu \
+    "1. 添加放行端口" \
+    "2. 查看当前规则" \
+    "3. 按规则编号删除指定规则" \
+    "4. 启用 UFW" \
+    "0. 返回主菜单"
+  printf '请选择: '
+  IFS= read -r choice || return 0
+  case "$choice" in
+    1) add_ufw_rules ;;
+    2) show_ufw_numbered ;;
+    3) delete_ufw_rule ;;
+    4) enable_ufw ;;
+    0) return 0 ;;
+    *) warn "无效选项"; return 1 ;;
+  esac
+}
+
+ssh_control_unit() {
+  if systemctl is-active --quiet ssh.socket 2>/dev/null || \
+     systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+    printf 'ssh.socket'
+    return 0
+  fi
+
+  local unit
+  for unit in ssh.service sshd.service; do
+    if systemctl cat "$unit" >/dev/null 2>&1; then
+      printf '%s' "$unit"
+      return 0
+    fi
+  done
+  return 1
+}
+
+reload_ssh() {
+  local unit
+  unit="$(ssh_control_unit)" || {
+    error "无法识别 SSH systemd 单元"
+    return 1
+  }
+
+  if [[ "$unit" == "ssh.socket" ]]; then
+    run_cmd systemctl daemon-reload || return 1
+    run_cmd systemctl restart ssh.socket || return 1
+    if systemctl is-active --quiet ssh.service 2>/dev/null; then
+      run_cmd systemctl reload ssh.service || return 1
+    fi
+  else
+    if (( DRY_RUN )); then
+      run_cmd systemctl reload "$unit"
+    elif ! systemctl reload "$unit"; then
+      warn "SSH 不支持 reload，尝试 restart"
+      run_cmd systemctl restart "$unit"
+    fi
+  fi
+}
+
+rollback_ssh_transaction() {
+  rollback_current_batch || return 1
+  if ! reload_ssh; then
+    mark_manual_recovery "SSH 配置文件已恢复，但服务重载失败"
+    return 1
+  fi
+}
+
+validate_sshd_config() {
+  local daemon
+  daemon="$(sshd_command)" || {
+    error "找不到 sshd"
+    return 1
+  }
+  "$daemon" -t
+}
+
+ssh_port_listening() {
+  local port="$1"
+  command -v ss >/dev/null 2>&1 || return 1
+  ss -H -ltn 2>/dev/null | awk -v wanted="$port" '
+    {
+      address=$4
+      sub(/^.*:/, "", address)
+      if (address == wanted) found=1
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+wait_for_ssh_port() {
+  local port="$1"
+  local attempt
+  for ((attempt=1; attempt<=20; attempt++)); do
+    if ssh_port_listening "$port"; then
+      (( attempt == 1 )) || info "SSH 端口 ${port} 在第 ${attempt} 次检查时开始监听"
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+wait_for_ssh_port_to_close() {
+  local port="$1"
+  local attempt
+  for ((attempt=1; attempt<=20; attempt++)); do
+    if ! ssh_port_listening "$port"; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+generate_high_port() {
+  local candidate random_value attempts=0
+  while (( attempts < 100 )); do
+    random_value="$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ')"
+    [[ "$random_value" =~ ^[0-9]+$ ]] || random_value="$RANDOM$RANDOM"
+    candidate=$((20000 + random_value % 45536))
+    if ! ssh_port_listening "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+    ((attempts += 1))
+  done
+  return 1
+}
+
+ensure_sshd_include() {
+  local main_config="/etc/ssh/sshd_config"
+  if grep -Eiq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf([[:space:]]|$)' "$main_config"; then
+    return 0
+  fi
+
+  if (( DRY_RUN )); then
+    printf '%s[预览]%s 在 %s 的首个 Match 块之前加入 Include\n' \
+      "$C_YELLOW" "$C_RESET" "$main_config"
+    return 0
+  fi
+
+  local temp_file
+  temp_file="$(new_temp_file sshd)" || return 1
+  if ! awk '
+    BEGIN { inserted=0 }
+    /^[[:space:]]*[Mm][Aa][Tt][Cc][Hh][[:space:]]/ && !inserted {
+      print "# BEGIN vps-init include"
+      print "Include /etc/ssh/sshd_config.d/*.conf"
+      print "# END vps-init include"
+      inserted=1
+    }
+    { print }
+    END {
+      if (!inserted) {
+        print "# BEGIN vps-init include"
+        print "Include /etc/ssh/sshd_config.d/*.conf"
+        print "# END vps-init include"
+      }
+    }
+  ' "$main_config" >"$temp_file"; then
+    rm -f -- "$temp_file" 2>/dev/null || true
+    return 1
+  fi
+
+  backup_file "$main_config" || {
+    rm -f -- "$temp_file" 2>/dev/null || true
+    return 1
+  }
+  mark_transaction_staged || return 1
+  if ! install -m 600 -- "$temp_file" "$main_config"; then
+    rm -f -- "$temp_file" 2>/dev/null || true
+    return 1
+  fi
+  rm -f -- "$temp_file" || warn "无法清理临时文件: ${temp_file}"
+  record_after_file "$main_config" || return 1
+}
+
+disable_external_ssh_port_lines() {
+  local managed_file="$1"
+  local file temp_file
+  local -a files=(/etc/ssh/sshd_config)
+  local -a dropins=()
+  shopt -s nullglob
+  dropins=(/etc/ssh/sshd_config.d/*.conf)
+  shopt -u nullglob
+  files+=("${dropins[@]}")
+
+  for file in "${files[@]}"; do
+    [[ "$file" == "$managed_file" || ! -f "$file" ]] && continue
+    grep -Eiq '^[[:space:]]*Port[[:space:]]+[0-9]+' "$file" || continue
+
+    if (( DRY_RUN )); then
+      printf '%s[预览]%s 注释 %s 中现有的全局 Port 指令\n' \
+        "$C_YELLOW" "$C_RESET" "$file"
+      continue
+    fi
+
+    temp_file="$(new_temp_file ssh-port)" || return 1
+    if ! sed -E 's/^([[:space:]]*)([Pp][Oo][Rr][Tt][[:space:]]+[0-9]+.*)$/\1# vps-init disabled previous port: \2/' \
+      "$file" >"$temp_file"; then
+      rm -f -- "$temp_file" 2>/dev/null || true
+      return 1
+    fi
+    backup_file "$file" || {
+      rm -f -- "$temp_file" 2>/dev/null || true
+      return 1
+    }
+    mark_transaction_staged || return 1
+    local file_mode
+    file_mode="$(stat -c %a "$file")" || return 1
+    if ! install -m "$file_mode" -- "$temp_file" "$file"; then
+      rm -f -- "$temp_file" 2>/dev/null || true
+      return 1
+    fi
+    rm -f -- "$temp_file" || warn "无法清理临时文件: ${temp_file}"
+    record_after_file "$file" || return 1
+  done
+}
+
+rollback_current_batch() {
+  local path
+  local failed=0
+  (( DRY_RUN )) && return 0
+  for path in "${!BACKED_UP[@]}"; do
+    if ! restore_file_from_current_run "$path"; then
+      failed=1
+      continue
+    fi
+    record_after_file "$path" || failed=1
+  done
+  if (( failed )); then
+    mark_manual_recovery "部分文件自动恢复失败，备份批次为 ${BACKUP_DIR##*/}"
+    return 1
+  fi
+  set_transaction_status ROLLED_BACK || return 1
+  TRANSACTION_ACTIVE=0
+  TRANSACTION_ROLLBACK_HANDLER=""
+}
+
+effective_ports_contain() {
+  local wanted="$1"
+  local port
+  while IFS= read -r port; do
+    [[ "$port" == "$wanted" ]] && return 0
+  done < <(effective_ssh_ports)
+  return 1
+}
+
+module_ssh_port() {
+  local port_input target_port suggested unit
+  local managed_file="/etc/ssh/sshd_config.d/00-vps-init-port.conf"
+  local -a current_ports=()
+  local -a stage_ports=()
+  local -A seen=()
+  local port stage_content final_content
+
+  heading "SSH 端口"
+  if ! sshd_command >/dev/null; then
+    error "系统未安装 OpenSSH Server"
+    return 1
+  fi
+  if ! command -v ss >/dev/null 2>&1; then
+    error "缺少 ss 命令，无法验证监听端口"
+    return 1
+  fi
+  unit="$(ssh_control_unit)" || {
+    error "无法识别 SSH 服务单元"
+    return 1
+  }
+  mapfile -t current_ports < <(effective_ssh_ports)
+  ((${#current_ports[@]} > 0)) || current_ports=(22)
+  printf '当前有效端口: %s\n' "${current_ports[*]}"
+  printf '服务单元: %s\n' "$unit"
+  if ufw_installed; then
+    printf 'UFW 状态: %s\n' "$(ufw_active && printf 'active' || printf 'inactive')"
+  else
+    printf 'UFW 状态: 未安装\n'
+  fi
+
+  suggested="$(generate_high_port)" || {
+    error "无法生成可用端口"
+    return 1
+  }
+  printf '输入目标端口 20000-65535，直接按 Enter 使用建议值 %s，输入 0 返回: ' "$suggested"
+  IFS= read -r port_input || return 0
+  [[ "$port_input" != "0" ]] || return 0
+  target_port="${port_input:-$suggested}"
+  if ! valid_high_port "$target_port"; then
+    error "SSH 端口必须是 20000-65535 的整数"
+    return 1
+  fi
+  if ssh_port_listening "$target_port" && ! effective_ports_contain "$target_port"; then
+    error "目标端口 ${target_port} 已被其他服务占用"
+    return 1
+  fi
+  if effective_ports_contain "$target_port"; then
+    success "SSH 已在端口 ${target_port} 上生效"
+    return 0
+  fi
+
+  if ufw_installed && ufw_active && ! ufw_rule_exists "${target_port}/tcp"; then
+    error "UFW 尚未放行 ${target_port}/tcp，请先通过选项 2 添加规则"
+    return 1
+  fi
+
+  heading "SSH 修改计划"
+  printf '当前端口: %s\n' "${current_ports[*]}"
+  printf '目标端口: %s\n' "$target_port"
+  printf '配置文件: %s\n' "$managed_file"
+  printf '第一阶段: 同时保留新旧端口\n'
+  printf '第二阶段: 验证新连接后只保留目标端口\n'
+  warn "请先在云厂商安全组中放行 ${target_port}/tcp"
+  warn "高位端口只能减少扫描噪声，不能代替密钥认证和防火墙"
+  confirm "确认开始修改 SSH 端口" || {
+    info "已取消 SSH 端口修改"
+    return 0
+  }
+
+  for port in "${current_ports[@]}" "$target_port"; do
+    valid_port "$port" || continue
+    if [[ -z "${seen[$port]+x}" ]]; then
+      seen["$port"]=1
+      stage_ports+=("$port")
+    fi
+  done
+
+  stage_content="$MANAGED_HEADER"$'\n'
+  stage_content+="# Temporary validation ports"$'\n'
+  for port in "${stage_ports[@]}"; do
+    stage_content+="Port ${port}"$'\n'
+  done
+  stage_content="${stage_content%$'\n'}"
+  final_content="$MANAGED_HEADER"$'\n'"Port ${target_port}"
+
+  start_backup_batch ssh-port rollback_ssh_transaction || return 1
+  record_metadata ssh_ports "${current_ports[*]}" || return 1
+  ensure_sshd_include || {
+    rollback_current_batch
+    return 1
+  }
+  disable_external_ssh_port_lines "$managed_file" || {
+    rollback_current_batch
+    return 1
+  }
+  write_managed_file "$managed_file" 600 "$stage_content" || {
+    rollback_current_batch
+    return 1
+  }
+
+  if (( DRY_RUN )); then
+    info "预览完成，未修改 SSH 端口"
+    return 0
+  fi
+
+  if ! validate_sshd_config || ! reload_ssh || ! wait_for_ssh_port "$target_port"; then
+    error "新端口未通过配置或监听验证，正在恢复"
+    rollback_current_batch
+    reload_ssh || true
+    return 1
+  fi
+
+  warn "请保持当前会话，另开终端通过端口 ${target_port} 登录"
+  if ! confirm_phrase "确认新终端已经成功登录" "SSH PORT OK"; then
+    warn "未确认新连接，正在恢复原 SSH 配置"
+    rollback_current_batch
+    reload_ssh || true
+    return 0
+  fi
+
+  write_managed_file "$managed_file" 600 "$final_content" || {
+    rollback_current_batch
+    reload_ssh || true
+    return 1
+  }
+  if ! validate_sshd_config || ! reload_ssh || ! wait_for_ssh_port "$target_port"; then
+    error "最终 SSH 配置验证失败，正在恢复"
+    rollback_current_batch
+    reload_ssh || true
+    return 1
+  fi
+
+  for port in "${current_ports[@]}"; do
+    if [[ "$port" != "$target_port" ]] && ! wait_for_ssh_port_to_close "$port"; then
+      warn "等待 10 秒后旧端口 ${port} 仍在监听，可能有其他 Include 配置或 socket 覆盖"
+    fi
+  done
+  commit_transaction || return 1
+  success "SSH 端口已设置为 ${target_port}"
+  warn "请返回选项 2 手动删除不再使用的旧 UFW 规则"
+}
+
+join_by_comma() {
+  local IFS=','
+  printf '%s' "$*"
+}
+
+read_fail2ban_duration() {
+  local prompt="$1"
+  local default_value="$2"
+  local value
+  printf '%s [%s]: ' "$prompt" "$default_value" >&2
+  IFS= read -r value || return 1
+  value="${value:-$default_value}"
+  valid_duration "$value" || return 1
+  printf '%s' "$value"
+}
+
+fail2ban_runtime_port() {
+  local actions action properties value
+  actions="$(fail2ban-client get sshd actions 2>/dev/null | tail -n 1)" || return 1
+  actions="${actions//,/ }"
+  actions="${actions//[/ }"
+  actions="${actions//]/ }"
+  actions="${actions//\'/}"
+  for action in $actions; do
+    [[ -n "$action" ]] || continue
+    properties="$(fail2ban-client get sshd actionproperties "$action" 2>/dev/null || true)"
+    [[ "$properties" == *port* ]] || continue
+    value="$(fail2ban-client get sshd action "$action" port 2>/dev/null | tail -n 1)"
+    if [[ -n "$value" ]]; then
+      printf '%s' "${value//[[:space:]]/}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+verify_fail2ban_runtime() {
+  local expected_ports="$1"
+  local expected_bantime="$2"
+  local expected_findtime="$3"
+  local expected_maxretry="$4"
+  local actual_ports actual_bantime actual_findtime actual_maxretry
+  local expected_bantime_seconds expected_findtime_seconds
+
+  actual_ports="$(fail2ban_runtime_port)" || {
+    error "无法读取 Fail2ban SSH jail 的最终端口"
+    return 1
+  }
+  actual_bantime="$(fail2ban-client get sshd bantime 2>/dev/null | tail -n 1)"
+  actual_findtime="$(fail2ban-client get sshd findtime 2>/dev/null | tail -n 1)"
+  actual_maxretry="$(fail2ban-client get sshd maxretry 2>/dev/null | tail -n 1)"
+  expected_bantime_seconds="$(fail2ban-client --str2sec "$expected_bantime" 2>/dev/null | tail -n 1)"
+  expected_findtime_seconds="$(fail2ban-client --str2sec "$expected_findtime" 2>/dev/null | tail -n 1)"
+
+  if [[ "$actual_ports" != "$expected_ports" ]]; then
+    error "Fail2ban 最终端口 ${actual_ports} 与期望值 ${expected_ports} 不一致"
+    return 1
+  fi
+  [[ -n "$actual_bantime" && -n "$actual_findtime" && -n "$actual_maxretry" ]] || {
+    error "无法读取 Fail2ban SSH jail 的最终封禁参数"
+    return 1
+  }
+  if [[ "$actual_bantime" != "$expected_bantime_seconds" || "$actual_findtime" != "$expected_findtime_seconds" ]]; then
+    error "Fail2ban 最终时间参数与期望值不一致"
+    return 1
+  fi
+  if [[ "$actual_maxretry" != "$expected_maxretry" ]]; then
+    error "Fail2ban 最终 maxretry=${actual_maxretry}，期望 ${expected_maxretry}"
+    return 1
+  fi
+}
+
+wait_for_fail2ban_jail() {
+  local attempt
+  for ((attempt=1; attempt<=20; attempt++)); do
+    if systemctl is-active --quiet fail2ban.service 2>/dev/null && \
+       fail2ban-client status sshd >/dev/null 2>&1; then
+      (( attempt == 1 )) || info "Fail2ban SSH jail 在第 ${attempt} 次检查时就绪"
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+rollback_fail2ban_transaction() {
+  rollback_current_batch || return 1
+  local failed=0
+  if (( FAIL2BAN_WAS_ENABLED )); then
+    systemctl enable fail2ban.service >/dev/null 2>&1 || failed=1
+  else
+    systemctl disable fail2ban.service >/dev/null 2>&1 || failed=1
+  fi
+  if (( FAIL2BAN_WAS_ACTIVE )); then
+    systemctl restart fail2ban.service >/dev/null 2>&1 || failed=1
+  else
+    systemctl stop fail2ban.service >/dev/null 2>&1 || failed=1
+  fi
+  if (( failed )); then
+    mark_manual_recovery "Fail2ban 文件已恢复，但服务状态恢复失败"
+    return 1
+  fi
+}
+
+module_fail2ban() {
+  local config_file="/etc/fail2ban/jail.d/vps-init-sshd.local"
+  local bantime findtime maxretry ignore_input backend config_content
+  local -a ports=()
+  local -a ignore_addresses=(127.0.0.0/8 ::1)
+  local address
+
+  heading "Fail2ban"
+  if ! command -v fail2ban-client >/dev/null 2>&1 || ! package_installed fail2ban; then
+    warn "尚未安装 Fail2ban，请先通过选项 1 安装必要环境或全能环境"
+    return 0
+  fi
+  mapfile -t ports < <(effective_ssh_ports) || {
+    error "无法读取 SSH 有效端口"
+    return 1
+  }
+  printf 'SSH 端口: %s\n' "${ports[*]}"
+
+  bantime="$(read_fail2ban_duration '封禁时间' '1h')" || {
+    error "封禁时间格式错误，例如 3600、30m、1h、1d"
+    return 1
+  }
+  findtime="$(read_fail2ban_duration '统计窗口' '10m')" || {
+    error "统计窗口格式错误"
+    return 1
+  }
+  printf '最大重试次数 [5]: '
+  IFS= read -r maxretry || return 0
+  maxretry="${maxretry:-5}"
+  if [[ ! "$maxretry" =~ ^[1-9][0-9]*$ ]] || (( 10#$maxretry > 100 )); then
+    error "最大重试次数必须是 1-100 的整数"
+    return 1
+  fi
+  printf '附加白名单 IP/CIDR，多个值用空格分隔，直接按 Enter 跳过: '
+  IFS= read -r ignore_input || return 0
+  if [[ -n "$ignore_input" ]]; then
+    for address in $ignore_input; do
+      if ! valid_ip_or_cidr "$address"; then
+        error "IP 或 CIDR 格式错误: ${address}"
+        return 1
+      fi
+      ignore_addresses+=("$address")
+    done
+  fi
+
+  if [[ -d /run/systemd/journal ]] && command -v journalctl >/dev/null 2>&1; then
+    backend=systemd
+  else
+    backend=auto
+  fi
+
+  heading "Fail2ban 修改计划"
+  printf '端口: %s\n' "$(join_by_comma "${ports[@]}")"
+  printf 'bantime: %s\nfindtime: %s\nmaxretry: %s\n' "$bantime" "$findtime" "$maxretry"
+  printf 'ignoreip: %s\nbackend: %s\n' "${ignore_addresses[*]}" "$backend"
+  printf '配置文件: %s\n' "$config_file"
+  confirm "确认配置 Fail2ban" || {
+    info "已取消 Fail2ban 配置"
+    return 0
+  }
+
+  config_content="$MANAGED_HEADER"$'\n'
+  config_content+="[sshd]"$'\n'
+  config_content+="enabled = true"$'\n'
+  config_content+="backend = ${backend}"$'\n'
+  config_content+="port = $(join_by_comma "${ports[@]}")"$'\n'
+  config_content+="ignoreip = ${ignore_addresses[*]}"$'\n'
+  config_content+="bantime = ${bantime}"$'\n'
+  config_content+="findtime = ${findtime}"$'\n'
+  config_content+="maxretry = ${maxretry}"
+
+  FAIL2BAN_WAS_ACTIVE=0
+  FAIL2BAN_WAS_ENABLED=0
+  systemctl is-active --quiet fail2ban.service 2>/dev/null && FAIL2BAN_WAS_ACTIVE=1
+  systemctl is-enabled --quiet fail2ban.service 2>/dev/null && FAIL2BAN_WAS_ENABLED=1
+  start_backup_batch fail2ban rollback_fail2ban_transaction || return 1
+  record_metadata fail2ban_active "$FAIL2BAN_WAS_ACTIVE" || return 1
+  record_metadata fail2ban_enabled "$FAIL2BAN_WAS_ENABLED" || return 1
+  write_managed_file "$config_file" 644 "$config_content" || return 1
+  if (( DRY_RUN )); then
+    info "预览完成，未配置 Fail2ban"
+    return 0
+  fi
+
+  if ! run_cmd fail2ban-client -t; then
+    error "Fail2ban 配置校验失败，正在恢复"
+    rollback_current_batch
+    return 1
+  fi
+  if ! run_cmd systemctl enable fail2ban.service || ! run_cmd systemctl restart fail2ban.service; then
+    error "Fail2ban 启动失败，正在恢复"
+    rollback_current_batch
+    if (( FAIL2BAN_WAS_ACTIVE )); then
+      systemctl restart fail2ban.service >/dev/null 2>&1 || true
+    else
+      systemctl stop fail2ban.service >/dev/null 2>&1 || true
+    fi
+    return 1
+  fi
+  if ! wait_for_fail2ban_jail; then
+    error "等待 10 秒后 Fail2ban SSH jail 仍未就绪"
+    rollback_current_batch
+    if (( FAIL2BAN_WAS_ACTIVE )); then
+      systemctl restart fail2ban.service >/dev/null 2>&1 || true
+    else
+      systemctl stop fail2ban.service >/dev/null 2>&1 || true
+    fi
+    return 1
+  fi
+  if ! verify_fail2ban_runtime "$(join_by_comma "${ports[@]}")" "$bantime" "$findtime" "$maxretry"; then
+    error "Fail2ban 最终配置被其他文件覆盖，正在恢复"
+    rollback_fail2ban_transaction || true
+    return 1
+  fi
+  commit_transaction || return 1
+  success "Fail2ban 已配置并启用"
+}
+
+user_has_valid_authorized_keys() {
+  local username="$1"
+  local passwd_entry home_path ssh_dir keys_file owner mode
+  passwd_entry="$(getent passwd "$username")" || return 1
+  home_path="$(cut -d: -f6 <<<"$passwd_entry")"
+  ssh_dir="${home_path}/.ssh"
+  keys_file="${ssh_dir}/authorized_keys"
+
+  [[ -d "$home_path" && -d "$ssh_dir" && -f "$keys_file" && -s "$keys_file" ]] || return 1
+  owner="$(stat -c %U "$home_path")"
+  [[ "$owner" == "$username" ]] || return 1
+  mode="$(stat -c %a "$home_path")"
+  (( (8#$mode & 8#022) == 0 )) || return 1
+  owner="$(stat -c %U "$ssh_dir")"
+  [[ "$owner" == "$username" ]] || return 1
+  owner="$(stat -c %U "$keys_file")"
+  [[ "$owner" == "$username" ]] || return 1
+  mode="$(stat -c %a "$ssh_dir")"
+  (( (8#$mode & 8#022) == 0 )) || return 1
+  mode="$(stat -c %a "$keys_file")"
+  (( (8#$mode & 8#022) == 0 )) || return 1
+  ssh-keygen -l -f "$keys_file" >/dev/null 2>&1
+}
+
+effective_auth_value() {
+  local username="$1"
+  local keyword="$2"
+  local daemon source_address host_name
+  daemon="$(sshd_command)" || return 1
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    source_address="${SSH_CONNECTION%% *}"
+  else
+    source_address=127.0.0.1
+  fi
+  host_name="$(hostname -f 2>/dev/null || hostname)"
+  "$daemon" -T -C "user=${username},host=${host_name},addr=${source_address}" 2>/dev/null |
+    awk -v wanted="$keyword" '
+      $1 == wanted && !found { print $2; found=1 }
+      END { exit(found ? 0 : 1) }
+    '
+}
+
+module_disable_password_login() {
+  local username auth_file="/etc/ssh/sshd_config.d/00-vps-init-auth.conf"
+  local auth_content password_value keyboard_value
+  local -a ports=()
+
+  heading "禁用密码登录"
+  if ! sshd_command >/dev/null; then
+    error "系统未安装 OpenSSH Server"
+    return 1
+  fi
+  mapfile -t ports < <(effective_ssh_ports)
+  printf '当前 SSH 端口: %s\n' "${ports[*]}"
+  printf '输入用于密钥登录的现有用户名，输入 0 返回: '
+  IFS= read -r username || return 0
+  [[ "$username" != "0" ]] || return 0
+  if [[ ! "$username" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || ! getent passwd "$username" >/dev/null; then
+    error "用户不存在或用户名格式错误"
+    return 1
+  fi
+  if ! user_has_valid_authorized_keys "$username"; then
+    error "${username} 的 authorized_keys、所有者或权限不符合要求"
+    return 1
+  fi
+
+  password_value="$(effective_auth_value "$username" passwordauthentication)"
+  keyboard_value="$(effective_auth_value "$username" kbdinteractiveauthentication)"
+  printf 'PasswordAuthentication: %s\n' "${password_value:-unknown}"
+  printf 'KbdInteractiveAuthentication: %s\n' "${keyboard_value:-unknown}"
+  if [[ "$password_value" == "no" && "$keyboard_value" == "no" ]]; then
+    success "密码认证已经禁用"
+    return 0
+  fi
+
+  warn "请保持当前会话，另开终端使用公钥登录用户 ${username}"
+  if ! confirm_phrase "确认公钥登录已经成功" "KEY LOGIN OK"; then
+    info "未确认密钥登录，不修改 SSH 认证配置"
+    return 0
+  fi
+
+  auth_content="$MANAGED_HEADER"$'\n'
+  auth_content+="PasswordAuthentication no"$'\n'
+  auth_content+="KbdInteractiveAuthentication no"
+
+  heading "认证修改计划"
+  printf '目标用户验证: %s\n' "$username"
+  printf '配置: PasswordAuthentication no\n'
+  printf '配置: KbdInteractiveAuthentication no\n'
+  printf '不修改: PermitRootLogin、AllowUsers\n'
+  confirm "确认禁用 SSH 密码登录" || {
+    info "已取消认证修改"
+    return 0
+  }
+
+  start_backup_batch ssh-auth rollback_ssh_transaction || return 1
+  record_metadata ssh_passwordauthentication "$password_value" || return 1
+  record_metadata ssh_kbdinteractiveauthentication "$keyboard_value" || return 1
+  ensure_sshd_include || {
+    rollback_current_batch
+    return 1
+  }
+  write_managed_file "$auth_file" 600 "$auth_content" || {
+    rollback_current_batch
+    return 1
+  }
+
+  if (( DRY_RUN )); then
+    info "预览完成，未修改 SSH 认证配置"
+    return 0
+  fi
+  if ! validate_sshd_config; then
+    error "SSH 配置校验失败，正在恢复"
+    rollback_current_batch
+    return 1
+  fi
+  password_value="$(effective_auth_value "$username" passwordauthentication)"
+  keyboard_value="$(effective_auth_value "$username" kbdinteractiveauthentication)"
+  if [[ "$password_value" != "no" || "$keyboard_value" != "no" ]]; then
+    error "托管配置没有成为最终有效值，可能存在更早的认证配置"
+    rollback_current_batch
+    return 1
+  fi
+  if ! reload_ssh; then
+    error "SSH 重载失败，正在恢复"
+    rollback_current_batch
+    reload_ssh || true
+    return 1
+  fi
+  password_value="$(effective_auth_value "$username" passwordauthentication)"
+  keyboard_value="$(effective_auth_value "$username" kbdinteractiveauthentication)"
+  if [[ "$password_value" != "no" || "$keyboard_value" != "no" ]]; then
+    error "SSH 重载后的认证状态不符合预期，正在恢复"
+    rollback_current_batch
+    reload_ssh || true
+    return 1
+  fi
+  commit_transaction || return 1
+  success "SSH 密码登录已禁用，root 登录策略保持不变"
+}
+
+valid_username() {
+  local username="$1"
+  ((${#username} <= 32)) && [[ "$username" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]
+}
+
+user_home() {
+  getent passwd "$1" | awk -F: '{print $6}'
+}
+
+user_primary_group() {
+  id -gn "$1" 2>/dev/null
+}
+
+prompt_existing_username() {
+  local username
+  printf '输入用户名，输入 0 返回: ' >&2
+  IFS= read -r username || return 1
+  [[ "$username" != "0" ]] || return 1
+  valid_username "$username" || {
+    error "用户名格式错误"
+    return 1
+  }
+  [[ "$username" != "root" ]] || {
+    error "用户管理模块不修改 root 账户"
+    return 1
+  }
+  getent passwd "$username" >/dev/null || {
+    error "用户不存在: ${username}"
+    return 1
+  }
+  printf '%s' "$username"
+}
+
+account_has_usable_password() {
+  local status
+  status="$(passwd -S "$1" 2>/dev/null | awk '{print $2}')"
+  [[ "$status" == "P" || "$status" == "PS" ]]
+}
+
+set_user_password() {
+  local username="$1"
+  local choice password first second
+  print_spaced_menu \
+    "1. 手动输入密码" \
+    "2. 生成随机强密码" \
+    "0. 返回上一步"
+  printf '请选择密码来源: '
+  IFS= read -r choice || return 0
+  case "$choice" in
+    1)
+      printf '输入密码: '
+      IFS= read -r -s first || return 1
+      printf '\n再次输入密码: '
+      IFS= read -r -s second || return 1
+      printf '\n'
+      [[ -n "$first" && "$first" == "$second" ]] || {
+        error "两次密码不一致或密码为空"
+        return 1
+      }
+      [[ "$first" != *:* ]] || {
+        error "密码不能包含冒号"
+        return 1
+      }
+      password="$first"
+      first=""
+      second=""
+      ;;
+    2)
+      password="$(head -c 24 /dev/urandom | base64)" || {
+        error "无法生成随机密码"
+        return 1
+      }
+      printf '\n随机密码仅显示一次，请立即保存:\n%s\n\n' "$password"
+      confirm_phrase "确认已经保存随机密码" "PASSWORD SAVED" || {
+        password=""
+        return 0
+      }
+      ;;
+    0) return 0 ;;
+    *) error "无效选项"; return 1 ;;
+  esac
+
+  if (( DRY_RUN )); then
+    password=""
+    info "预览完成，未设置账户密码"
+    return 0
+  fi
+  if ! printf '%s:%s\n' "$username" "$password" | chpasswd; then
+    password=""
+    error "设置账户密码失败"
+    return 1
+  fi
+  password=""
+  if ! account_has_usable_password "$username"; then
+    error "账户密码状态验证失败"
+    return 1
+  fi
+  success "${username} 的账户密码已设置"
+  local password_auth keyboard_auth
+  password_auth="$(effective_auth_value "$username" passwordauthentication 2>/dev/null || printf 'unknown')"
+  keyboard_auth="$(effective_auth_value "$username" kbdinteractiveauthentication 2>/dev/null || printf 'unknown')"
+  if [[ "$password_auth" == "no" && "$keyboard_auth" == "no" ]]; then
+    warn "SSH 密码认证已关闭，该密码只能用于本地控制台或 sudo"
+  else
+    info "SSH 认证状态: password=${password_auth}，keyboard-interactive=${keyboard_auth}"
+  fi
+}
+
+validate_public_key_line() {
+  local key_line="$1"
+  public_key_fingerprint "$key_line" >/dev/null
+}
+
+public_key_fingerprint() {
+  local key_line="$1"
+  local temp_key
+  temp_key="$(new_temp_file public-key)" || return 1
+  if ! printf '%s\n' "$key_line" >"$temp_key" || ! chmod 600 "$temp_key"; then
+    rm -f -- "$temp_key" 2>/dev/null || true
+    return 1
+  fi
+  local fingerprint_output
+  fingerprint_output="$(ssh-keygen -l -f "$temp_key" 2>/dev/null)" || {
+    rm -f -- "$temp_key" 2>/dev/null || true
+    return 1
+  }
+  rm -f -- "$temp_key" || true
+  awk 'NR == 1 {print $2}' <<<"$fingerprint_output"
+}
+
+collect_public_keys() {
+  local source_file="$1"
+  local output_file="$2"
+  local line fingerprint valid_count=0
+  local -A seen_fingerprints=()
+  : >"$output_file" || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    if ! validate_public_key_line "$line"; then
+      error "检测到无效公钥，停止写入"
+      return 1
+    fi
+    fingerprint="$(public_key_fingerprint "$line")" || return 1
+    [[ -z "${seen_fingerprints[$fingerprint]+x}" ]] || continue
+    seen_fingerprints["$fingerprint"]=1
+    printf '%s\n' "$line" >>"$output_file" || return 1
+    ((valid_count += 1))
+  done <"$source_file"
+  (( valid_count > 0 ))
+}
+
+configure_user_public_keys() {
+  local username="$1"
+  local home_path group_name ssh_dir keys_file choice source_user source_file
+  local raw_keys validated_keys merged_keys line fingerprint
+  local -A existing_fingerprints=()
+  if ! command -v ssh-keygen >/dev/null 2>&1; then
+    error "缺少 ssh-keygen，请先通过选项 1 安装必要环境"
+    return 1
+  fi
+  home_path="$(user_home "$username")"
+  group_name="$(user_primary_group "$username")"
+  [[ -d "$home_path" && -n "$group_name" ]] || {
+    error "无法确定用户 home 或主组"
+    return 1
+  }
+  ssh_dir="${home_path}/.ssh"
+  keys_file="${ssh_dir}/authorized_keys"
+  raw_keys="$(new_temp_file raw-keys)" || return 1
+  validated_keys="$(new_temp_file valid-keys)" || return 1
+  merged_keys="$(new_temp_file merged-keys)" || return 1
+
+  print_spaced_menu \
+    "1. 复制当前登录用户的 authorized_keys" \
+    "2. 粘贴一条或多条公钥" \
+    "3. 检查已有 authorized_keys" \
+    "0. 返回上一步"
+  printf '请选择公钥来源: '
+  IFS= read -r choice || return 0
+  case "$choice" in
+    1)
+      source_user="${SUDO_USER:-${USER:-root}}"
+      source_file="$(user_home "$source_user")/.ssh/authorized_keys"
+      if [[ ! -s "$source_file" ]]; then
+        error "当前登录用户没有可复制的 authorized_keys"
+        return 1
+      fi
+      cp -- "$source_file" "$raw_keys" || return 1
+      ;;
+    2)
+      printf '逐行粘贴公钥，输入空行结束:\n'
+      : >"$raw_keys" || return 1
+      while IFS= read -r line; do
+        [[ -n "$line" ]] || break
+        printf '%s\n' "$line" >>"$raw_keys" || return 1
+      done
+      ;;
+    3)
+      if user_has_valid_authorized_keys "$username"; then
+        success "${username} 的 authorized_keys 和权限有效"
+        ssh-keygen -l -f "$keys_file" 2>/dev/null || true
+      else
+        warn "${username} 的 authorized_keys 不存在、无有效公钥或权限不合格"
+      fi
+      return 0
+      ;;
+    0) return 0 ;;
+    *) error "无效选项"; return 1 ;;
+  esac
+
+  collect_public_keys "$raw_keys" "$validated_keys" || return 1
+  : >"$merged_keys" || return 1
+  if [[ -f "$keys_file" ]]; then
+    cat -- "$keys_file" >"$merged_keys" || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ -n "$line" && "$line" != \#* ]] || continue
+      fingerprint="$(public_key_fingerprint "$line" 2>/dev/null || true)"
+      [[ -n "$fingerprint" ]] && existing_fingerprints["$fingerprint"]=1
+    done <"$keys_file"
+  fi
+  while IFS= read -r line; do
+    fingerprint="$(public_key_fingerprint "$line")" || return 1
+    if [[ -z "${existing_fingerprints[$fingerprint]+x}" ]]; then
+      printf '%s\n' "$line" >>"$merged_keys" || return 1
+      existing_fingerprints["$fingerprint"]=1
+    fi
+  done <"$validated_keys"
+
+  heading "SSH 公钥修改计划"
+  printf '目标用户: %s\n目标文件: %s\n' "$username" "$keys_file"
+  ssh-keygen -l -f "$validated_keys" 2>/dev/null | sed 's/^/公钥指纹: /' || true
+  confirm "确认写入以上公钥" || return 0
+
+  if (( DRY_RUN )); then
+    info "预览完成，未写入 authorized_keys"
+    return 0
+  fi
+  start_backup_batch user-authorized-keys rollback_current_batch || return 1
+  backup_file "$keys_file" || return 1
+  mark_transaction_staged || return 1
+  if ! install -d -m 700 -o "$username" -g "$group_name" "$ssh_dir" || \
+     ! install -m 600 -o "$username" -g "$group_name" "$merged_keys" "$keys_file"; then
+    error "无法安装 authorized_keys，正在恢复"
+    rollback_current_batch || true
+    return 1
+  fi
+  record_after_file "$keys_file" || return 1
+  if ! user_has_valid_authorized_keys "$username"; then
+    error "authorized_keys 最终验证失败，正在恢复"
+    rollback_current_batch || true
+    return 1
+  fi
+  commit_transaction || return 1
+  success "${username} 的 SSH 公钥已配置"
+  warn "请从另一终端验证该用户的 SSH 密钥登录"
+}
+
+configure_login_credentials() {
+  local username="${1:-}"
+  local choice
+  [[ -n "$username" ]] || username="$(prompt_existing_username)" || return 0
+  print_spaced_menu \
+    "1. 配置密码凭据" \
+    "2. 配置 SSH 密钥凭据" \
+    "3. 同时配置密码与 SSH 密钥" \
+    "4. 查看当前凭据状态" \
+    "5. 锁定账户密码" \
+    "0. 返回上一步"
+  printf '请选择: '
+  IFS= read -r choice || return 0
+  case "$choice" in
+    1) set_user_password "$username" ;;
+    2) configure_user_public_keys "$username" ;;
+    3)
+      set_user_password "$username" || return 1
+      configure_user_public_keys "$username"
+      ;;
+    4)
+      passwd -S "$username" 2>/dev/null || true
+      if user_has_valid_authorized_keys "$username"; then
+        success "SSH 公钥有效"
+      else
+        warn "未发现有效 SSH 公钥或权限不合格"
+      fi
+      printf 'PasswordAuthentication: %s\n' "$(effective_auth_value "$username" passwordauthentication 2>/dev/null || printf 'unknown')"
+      printf 'KbdInteractiveAuthentication: %s\n' "$(effective_auth_value "$username" kbdinteractiveauthentication 2>/dev/null || printf 'unknown')"
+      ;;
+    5)
+      if ! user_has_valid_authorized_keys "$username"; then
+        error "锁定密码前必须配置有效 SSH 公钥"
+        return 1
+      fi
+      local sudoers_file="/etc/sudoers.d/90-vps-init-${username}"
+      if [[ ! -f "$sudoers_file" ]] || ! managed_file_owned "$sudoers_file"; then
+        error "锁定密码前必须启用脚本托管的 sudo 免密码配置"
+        return 1
+      fi
+      confirm_phrase "请先验证该用户的密钥登录，锁定后无法使用账户密码" "LOCK PASSWORD" || return 0
+      run_cmd passwd -l "$username" || return 1
+      success "${username} 的账户密码已锁定"
+      ;;
+    0) return 0 ;;
+    *) error "无效选项"; return 1 ;;
+  esac
+}
+
+ensure_user_in_sudo_group() {
+  local username="$1"
+  if id -nG "$username" | tr ' ' '\n' | grep -Fxq sudo; then
+    return 0
+  fi
+  run_cmd usermod -aG sudo "$username" || return 1
+}
+
+configure_sudo_policy() {
+  local username="${1:-}"
+  local choice sudoers_file content temp_sudo
+  local password_ready=1
+  [[ -n "$username" ]] || username="$(prompt_existing_username)" || return 0
+  sudoers_file="/etc/sudoers.d/90-vps-init-${username}"
+  print_spaced_menu \
+    "1. sudo 需要账户密码" \
+    "2. sudo 免密码" \
+    "3. 查看当前 sudo 权限" \
+    "0. 返回上一步"
+  printf '请选择: '
+  IFS= read -r choice || return 0
+  case "$choice" in
+    1)
+      ensure_user_in_sudo_group "$username" || return 1
+      if [[ -e "$sudoers_file" ]]; then
+        if ! managed_file_owned "$sudoers_file"; then
+          error "sudoers 文件不属于本脚本，拒绝删除"
+          return 1
+        fi
+        start_backup_batch user-sudo-password rollback_current_batch || return 1
+        backup_file "$sudoers_file" || return 1
+        mark_transaction_staged || return 1
+        run_cmd rm -f -- "$sudoers_file" || {
+          rollback_current_batch || true
+          return 1
+        }
+        if ! visudo -cf /etc/sudoers; then
+          error "完整 sudoers 校验失败，正在恢复"
+          rollback_current_batch || true
+          return 1
+        fi
+        record_after_file "$sudoers_file" || return 1
+        commit_transaction || return 1
+      fi
+      if ! account_has_usable_password "$username"; then
+        password_ready=0
+        warn "${username} 没有可用账户密码，密码 sudo 暂不可用"
+        warn "方案要求不强制设置密码，请稍后通过登录凭据菜单配置"
+      fi
+      if sudo -l -U "$username" 2>/dev/null | grep -q 'NOPASSWD:'; then
+        warn "其他 sudoers 配置仍授予 NOPASSWD，本脚本不会删除非托管文件"
+      elif (( password_ready )); then
+        success "${username} 已使用密码 sudo"
+      else
+        warn "${username} 已加入 sudo 组，但需要先设置账户密码"
+      fi
+      ;;
+    2)
+      ensure_user_in_sudo_group "$username" || return 1
+      warn "NOPASSWD 允许该用户无需再次验证即可获得 root 权限"
+      confirm_phrase "确认启用 sudo 免密码" "ENABLE NOPASSWD" || return 0
+      content="$MANAGED_HEADER"$'\n'"${username} ALL=(ALL:ALL) NOPASSWD: ALL"
+      temp_sudo="$(new_temp_file sudoers)" || return 1
+      printf '%s\n' "$content" >"$temp_sudo" || return 1
+      chmod 440 "$temp_sudo" || return 1
+      visudo -cf "$temp_sudo" || {
+        error "sudoers 片段校验失败"
+        return 1
+      }
+      start_backup_batch user-sudo-nopasswd rollback_current_batch || return 1
+      backup_file "$sudoers_file" || return 1
+      write_managed_file "$sudoers_file" 440 "$content" || return 1
+      if (( DRY_RUN )); then
+        info "预览完成，未修改 sudoers"
+        return 0
+      fi
+      mark_transaction_staged || return 1
+      if ! chown root:root "$sudoers_file" || ! chmod 440 "$sudoers_file" || ! visudo -cf /etc/sudoers; then
+        error "sudoers 完整校验失败，正在恢复"
+        rollback_current_batch || true
+        return 1
+      fi
+      record_after_file "$sudoers_file" || return 1
+      commit_transaction || return 1
+      success "${username} 已启用 sudo 免密码"
+      ;;
+    3) sudo -l -U "$username" ;;
+    0) return 0 ;;
+    *) error "无效选项"; return 1 ;;
+  esac
+}
+
+check_user_configuration() {
+  local username
+  username="$(prompt_existing_username)" || return 0
+  heading "用户配置"
+  id "$username"
+  passwd -S "$username" 2>/dev/null || true
+  sudo -l -U "$username" || true
+  if user_has_valid_authorized_keys "$username"; then
+    success "authorized_keys 与权限有效"
+  else
+    warn "authorized_keys 不存在、没有有效公钥或权限不合格"
+  fi
+  printf 'PasswordAuthentication: %s\n' "$(effective_auth_value "$username" passwordauthentication 2>/dev/null || printf 'unknown')"
+  printf 'KbdInteractiveAuthentication: %s\n' "$(effective_auth_value "$username" kbdinteractiveauthentication 2>/dev/null || printf 'unknown')"
+}
+
+create_or_manage_user() {
+  local username
+  local -a group_option=()
+  printf '输入管理用户名，输入 0 返回: '
+  IFS= read -r username || return 0
+  [[ "$username" != "0" ]] || return 0
+  valid_username "$username" || {
+    error "用户名格式错误"
+    return 1
+  }
+  [[ "$username" != "root" ]] || {
+    error "用户管理模块不修改 root 账户"
+    return 1
+  }
+
+  if getent passwd "$username" >/dev/null; then
+    info "用户已经存在，不重复创建"
+    id "$username"
+    confirm "确认完善该用户的登录凭据和 sudo 权限" || return 0
+  else
+    heading "创建用户计划"
+    printf '用户名: %s\nhome: /home/%s\nshell: /bin/bash\n附加组: sudo\n' "$username" "$username"
+    confirm "确认创建管理用户" || return 0
+    if getent group "$username" >/dev/null; then
+      group_option=(-g "$username")
+    else
+      group_option=(-U)
+    fi
+    if (( DRY_RUN )); then
+      printf '%s[预览]%s useradd -m -s /bin/bash %s\n' "$C_YELLOW" "$C_RESET" "$username"
+      info "新用户不存在，预览模式不继续执行凭据和 sudo 状态检查"
+      return 0
+    else
+      run_cmd useradd -m -s /bin/bash "${group_option[@]}" "$username" || return 1
+    fi
+  fi
+  ensure_user_in_sudo_group "$username" || return 1
+  id "$username" || return 1
+  sudo -l -U "$username" >/dev/null 2>&1 || warn "sudo 权限尚未完整配置"
+
+  info "推荐组合: SSH 密钥凭据 + sudo 需要账户密码"
+  if confirm "现在配置登录凭据"; then
+    configure_login_credentials "$username" || return 1
+  fi
+  if confirm "现在配置 sudo 验证方式"; then
+    configure_sudo_policy "$username" || return 1
+  fi
+  return 0
+}
+
+module_user_management() {
+  local choice
+  heading "用户管理"
+  local required_command
+  for required_command in sudo visudo ssh-keygen chpasswd useradd usermod; do
+    if ! command -v "$required_command" >/dev/null 2>&1; then
+      warn "缺少 ${required_command}，请先通过选项 1 安装必要环境"
+      return 0
+    fi
+  done
+  print_spaced_menu \
+    "1. 创建或完善管理用户" \
+    "2. 检查用户配置" \
+    "0. 返回主菜单"
+  printf '请选择: '
+  IFS= read -r choice || return 0
+  case "$choice" in
+    1) create_or_manage_user ;;
+    2) check_user_configuration ;;
+    0) return 0 ;;
+    *) error "无效选项"; return 1 ;;
+  esac
+}
+
+configure_timezone() {
+  local choice timezone current_timezone
+  current_timezone="$(timedatectl show --property=Timezone --value 2>/dev/null || true)"
+  heading "设置时区"
+  timedatectl status --no-pager 2>/dev/null || true
+  printf '\n'
+  print_spaced_menu \
+    "1. Asia/Shanghai" \
+    "2. UTC" \
+    "3. Asia/Hong_Kong" \
+    "4. Asia/Tokyo" \
+    "5. America/Los_Angeles" \
+    "6. America/New_York" \
+    "7. Europe/London" \
+    "8. 自定义时区" \
+    "0. 返回主菜单"
+  printf '请选择: '
+  IFS= read -r choice || return 0
+  case "$choice" in
+    1) timezone=Asia/Shanghai ;;
+    2) timezone=UTC ;;
+    3) timezone=Asia/Hong_Kong ;;
+    4) timezone=Asia/Tokyo ;;
+    5) timezone=America/Los_Angeles ;;
+    6) timezone=America/New_York ;;
+    7) timezone=Europe/London ;;
+    8)
+      printf '输入时区名称，输入 0 返回: '
+      IFS= read -r timezone || return 0
+      [[ "$timezone" != "0" ]] || return 0
+      ;;
+    0) return 0 ;;
+    *) error "无效选项"; return 1 ;;
+  esac
+
+  if ! timedatectl list-timezones | grep -Fqx "$timezone"; then
+    error "系统时区数据库中不存在 ${timezone}"
+    return 1
+  fi
+  if [[ "$current_timezone" == "$timezone" ]]; then
+    success "当前时区已经是 ${timezone}"
+    return 0
+  fi
+
+  printf '当前时区: %s\n目标时区: %s\n' "${current_timezone:-unknown}" "$timezone"
+  confirm "确认修改时区" || {
+    info "已取消时区修改"
+    return 0
+  }
+  run_cmd timedatectl set-timezone "$timezone" || return 1
+  if (( DRY_RUN )); then
+    info "预览完成，未修改时区"
+  elif [[ "$(timedatectl show --property=Timezone --value)" == "$timezone" ]]; then
+    success "时区已设置为 ${timezone}"
+  else
+    error "时区验证失败"
+    [[ -n "$current_timezone" ]] && timedatectl set-timezone "$current_timezone" >/dev/null 2>&1 || true
+    return 1
+  fi
+}
+
+show_time_sync_status() {
+  heading "时间同步状态"
+  timedatectl status --no-pager 2>/dev/null || true
+  local unit
+  for unit in systemd-timesyncd.service chrony.service chronyd.service ntp.service; do
+    if systemctl cat "$unit" >/dev/null 2>&1; then
+      printf '%s: active=%s enabled=%s\n' "$unit" \
+        "$(systemctl is-active "$unit" 2>/dev/null || true)" \
+        "$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+    fi
+  done
+}
+
+enable_time_sync() {
+  local unit
+  local -a active_units=()
+  for unit in systemd-timesyncd.service chrony.service chronyd.service ntp.service; do
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+      active_units+=("$unit")
+    fi
+  done
+  if ((${#active_units[@]} > 1)); then
+    error "检测到多个活动时间同步服务: ${active_units[*]}"
+    warn "请先人工处理冲突，本脚本不会停用任何服务"
+    return 1
+  fi
+  if ((${#active_units[@]} == 1)); then
+    success "时间同步服务已运行: ${active_units[0]}"
+    show_time_sync_status
+    return 0
+  fi
+
+  local can_ntp
+  can_ntp="$(timedatectl show --property=CanNTP --value 2>/dev/null || true)"
+  if [[ "$can_ntp" != "yes" ]]; then
+    error "系统没有可由 timedatectl 启用的时间同步服务"
+    return 1
+  fi
+  confirm "确认启用系统现有时间同步服务" || return 0
+  run_cmd timedatectl set-ntp true || return 1
+  if (( DRY_RUN )); then
+    info "预览完成，未修改时间同步状态"
+    return 0
+  fi
+  sleep 1
+  local ntp_state
+  ntp_state="$(timedatectl show --property=NTP --value 2>/dev/null || true)"
+  if [[ "$ntp_state" == "yes" ]]; then
+    success "时间同步服务已启用"
+    show_time_sync_status
+  else
+    error "时间同步服务未进入启用状态"
+    return 1
+  fi
+}
+
+module_timezone() {
+  local choice
+  heading "时区与时间同步"
+  print_spaced_menu \
+    "1. 设置时区" \
+    "2. 检查时间同步" \
+    "3. 启用现有时间同步服务" \
+    "0. 返回主菜单"
+  printf '请选择: '
+  IFS= read -r choice || return 0
+  case "$choice" in
+    1) configure_timezone ;;
+    2) show_time_sync_status ;;
+    3) enable_time_sync ;;
+    0) return 0 ;;
+    *) error "无效选项"; return 1 ;;
+  esac
+}
+
+swap_is_managed() {
+  grep -Fqx '# BEGIN vps-init swap' /etc/fstab 2>/dev/null &&
+    grep -Fqx '# END vps-init swap' /etc/fstab 2>/dev/null
+}
+
+swap_is_active() {
+  local path="$1"
+  swapon --show=NAME --noheadings 2>/dev/null | awk -v wanted="$path" '$1 == wanted {found=1} END {exit(found ? 0 : 1)}'
+}
+
+parse_size_mib() {
+  local input="${1^^}"
+  local number unit
+  PARSED_SIZE_MIB=0
+  if [[ "$input" =~ ^([0-9]+)(M|MB|MIB)?$ ]]; then
+    number="${BASH_REMATCH[1]}"
+    PARSED_SIZE_MIB=$((10#$number))
+  elif [[ "$input" =~ ^([0-9]+)(G|GB|GIB)$ ]]; then
+    number="${BASH_REMATCH[1]}"
+    PARSED_SIZE_MIB=$((10#$number * 1024))
+  else
+    return 1
+  fi
+}
+
+recommended_swap_mib() {
+  local memory_mib="$1"
+  if (( memory_mib <= 1024 )); then
+    printf '1024'
+  elif (( memory_mib <= 2048 )); then
+    printf '2048'
+  elif (( memory_mib <= 8192 )); then
+    printf '4096'
+  else
+    printf '4096'
+  fi
+}
+
+rewrite_swap_fstab() {
+  local mode="$1"
+  local temp_file file_mode
+  if (( DRY_RUN )); then
+    printf '%s[预览]%s %s vps-init Swap 持久化配置\n' \
+      "$C_YELLOW" "$C_RESET" "$([[ "$mode" == add ]] && printf '写入' || printf '删除')"
+    return 0
+  fi
+
+  temp_file="$(new_temp_file fstab)" || return 1
+  if ! awk '
+    $0 == "# BEGIN vps-init swap" { skipping=1; next }
+    $0 == "# END vps-init swap" { skipping=0; next }
+    !skipping { print }
+  ' /etc/fstab >"$temp_file"; then
+    rm -f -- "$temp_file" 2>/dev/null || true
+    error "无法生成新的 /etc/fstab"
+    return 1
+  fi
+  if [[ "$mode" == "add" ]]; then
+    if ! printf '\n# BEGIN vps-init swap\n/swapfile none swap sw 0 0\n# END vps-init swap\n' >>"$temp_file"; then
+      rm -f -- "$temp_file" 2>/dev/null || true
+      return 1
+    fi
+  fi
+
+  backup_file /etc/fstab || {
+    rm -f -- "$temp_file" 2>/dev/null || true
+    return 1
+  }
+  file_mode="$(stat -c %a /etc/fstab)" || return 1
+  mark_transaction_staged || {
+    rm -f -- "$temp_file" 2>/dev/null || true
+    return 1
+  }
+  if ! install -m "$file_mode" -- "$temp_file" /etc/fstab; then
+    rm -f -- "$temp_file" 2>/dev/null || true
+    return 1
+  fi
+  rm -f -- "$temp_file" || warn "无法清理临时文件: ${temp_file}"
+  record_after_file /etc/fstab || return 1
+}
+
+create_swap_payload() {
+  local target="$1"
+  local size_mib="$2"
+  local fs_type="$3"
+
+  rm -f -- "$target" || return 1
+  if [[ "$fs_type" == "btrfs" ]]; then
+    if ! command -v btrfs >/dev/null 2>&1 || \
+       ! btrfs filesystem mkswapfile --help >/dev/null 2>&1; then
+      error "当前 Btrfs 环境缺少可靠的 swapfile 创建命令"
+      return 1
+    fi
+    btrfs filesystem mkswapfile --size "${size_mib}m" "$target" || return 1
+  else
+    if ! fallocate -l "${size_mib}M" "$target"; then
+      warn "fallocate 失败，改用 dd 分配 Swap 文件"
+      dd if=/dev/zero of="$target" bs=1M count="$size_mib" status=progress || return 1
+    fi
+    chmod 600 -- "$target" || return 1
+    mkswap "$target" >/dev/null || return 1
+  fi
+  chmod 600 -- "$target" || return 1
+}
+
+restore_previous_swap() {
+  local old_size_mib="$1"
+  local old_active="$2"
+  local fs_type="$3"
+  (( old_size_mib > 0 )) || return 0
+  warn "尝试恢复原 Swap 文件大小 ${old_size_mib} MiB"
+  if create_swap_payload /swapfile "$old_size_mib" "$fs_type"; then
+    if (( old_active )) && ! swapon /swapfile >/dev/null 2>&1; then
+      return 1
+    fi
+    return 0
+  fi
+  return 1
+}
+
+rollback_swap_transaction() {
+  local failed=0
+  if swap_is_active /swapfile; then
+    swapoff /swapfile >/dev/null 2>&1 || failed=1
+  fi
+  rm -f -- /swapfile || failed=1
+  if (( SWAP_OLD_SIZE_MIB > 0 )); then
+    if ! create_swap_payload /swapfile "$SWAP_OLD_SIZE_MIB" "$SWAP_OLD_FS_TYPE"; then
+      failed=1
+    elif (( SWAP_OLD_ACTIVE )); then
+      swapon /swapfile >/dev/null 2>&1 || failed=1
+    fi
+  fi
+  rollback_current_batch || failed=1
+  if (( failed )); then
+    mark_manual_recovery "Swap 自动恢复失败，请检查 /swapfile 和 /etc/fstab"
+    return 1
+  fi
+}
+
+configure_swap() {
+  local memory_mib free_mib old_size_mib=0 capacity_mib reserve_mib max_mib recommended_mib
+  local foreign_swap_mib=0 base_recommendation
+  local input size_mib fs_type old_active=0 temp_swap="/swapfile.vps-init.$$"
+
+  memory_mib="$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo)"
+  free_mib="$(df -Pm / | awk 'NR == 2 {print $4}')"
+  fs_type="$(findmnt -no FSTYPE / 2>/dev/null || printf 'unknown')"
+  [[ -e /swapfile ]] && old_size_mib=$(( ($(stat -c %s /swapfile) + 1048575) / 1048576 ))
+  swap_is_active /swapfile && old_active=1
+  foreign_swap_mib="$(swapon --show=NAME,SIZE --bytes --noheadings 2>/dev/null |
+    awk '$1 != "/swapfile" {sum += $2} END {print int(sum/1048576)}')"
+  [[ "$foreign_swap_mib" =~ ^[0-9]+$ ]] || foreign_swap_mib=0
+
+  if [[ -e /swapfile ]] && ! swap_is_managed; then
+    error "/swapfile 已存在但不属于本脚本，本次不接管该文件"
+    return 1
+  fi
+
+  capacity_mib=$((free_mib + old_size_mib))
+  reserve_mib=$((capacity_mib / 10))
+  (( reserve_mib < 1024 )) && reserve_mib=1024
+  max_mib=$((capacity_mib - reserve_mib))
+  (( max_mib > 0 )) || {
+    error "磁盘剩余空间不足"
+    return 1
+  }
+  base_recommendation="$(recommended_swap_mib "$memory_mib")"
+  recommended_mib=$((base_recommendation - foreign_swap_mib))
+  (( recommended_mib < 0 )) && recommended_mib=0
+  (( recommended_mib > max_mib )) && recommended_mib=$max_mib
+
+  if (( foreign_swap_mib > 0 )); then
+    warn "检测到 ${foreign_swap_mib} MiB 非托管 Swap，本脚本不会修改它"
+    swapon --show=NAME,TYPE,SIZE --noheadings 2>/dev/null | awk '$1 != "/swapfile" {print}'
+    if (( recommended_mib == 0 )); then
+      info "现有外部 Swap 已达到自动建议总量，建议保持现状"
+    fi
+  fi
+
+  printf '输入 Swap 大小，支持 2048M、2G，直接按 Enter 使用建议值 %sM，输入 0 返回: ' "$recommended_mib"
+  IFS= read -r input || return 0
+  input="${input:-${recommended_mib}M}"
+  parse_size_mib "$input" || {
+    error "Swap 大小格式错误"
+    return 1
+  }
+  size_mib="$PARSED_SIZE_MIB"
+  (( size_mib > 0 )) || return 0
+  if (( size_mib > max_mib )); then
+    error "请求 ${size_mib} MiB，当前安全上限为 ${max_mib} MiB"
+    return 1
+  fi
+
+  heading "Swap 修改计划"
+  printf '内存: %s MiB\n文件系统: %s\n可用磁盘: %s MiB\n' "$memory_mib" "$fs_type" "$free_mib"
+  printf '当前 /swapfile: %s MiB\n目标 /swapfile: %s MiB\n' "$old_size_mib" "$size_mib"
+  printf '外部 Swap: %s MiB\n完成后预计总 Swap: %s MiB\n' "$foreign_swap_mib" "$((foreign_swap_mib + size_mib))"
+  warn "替换现有托管 Swap 时会先执行 swapoff"
+  if (( foreign_swap_mib > 0 )); then
+    confirm_phrase "系统已有非托管 Swap，确认仍要增加或替换 /swapfile" "ADD SWAP" || {
+      info "已取消 Swap 修改"
+      return 0
+    }
+  else
+    confirm "确认创建或替换 /swapfile" || {
+      info "已取消 Swap 修改"
+      return 0
+    }
+  fi
+
+  if (( DRY_RUN )); then
+    printf '%s[预览]%s 创建 %s MiB 的 /swapfile 并写入 /etc/fstab\n' \
+      "$C_YELLOW" "$C_RESET" "$size_mib"
+    return 0
+  fi
+
+  SWAP_OLD_SIZE_MIB="$old_size_mib"
+  SWAP_OLD_ACTIVE="$old_active"
+  SWAP_OLD_FS_TYPE="$fs_type"
+  start_backup_batch swap rollback_swap_transaction || return 1
+  record_metadata swap_old_size_mib "$SWAP_OLD_SIZE_MIB" || return 1
+  record_metadata swap_old_active "$SWAP_OLD_ACTIVE" || return 1
+  record_metadata swap_fs_type "$SWAP_OLD_FS_TYPE" || return 1
+  record_metadata swap_foreign_mib "$foreign_swap_mib" || return 1
+  backup_file /etc/fstab || return 1
+  mark_transaction_staged || return 1
+  rm -f -- "$temp_swap" || {
+    rollback_swap_transaction || true
+    return 1
+  }
+  if [[ -e /swapfile ]]; then
+    swapoff /swapfile || {
+      error "无法停用现有 /swapfile"
+      return 1
+    }
+    if ! rm -f -- /swapfile; then
+      error "无法移除现有 /swapfile，正在恢复"
+      rollback_swap_transaction || true
+      return 1
+    fi
+  fi
+
+  if ! create_swap_payload "$temp_swap" "$size_mib" "$fs_type"; then
+    rm -f -- "$temp_swap" 2>/dev/null || true
+    rollback_swap_transaction || true
+    return 1
+  fi
+  if ! mv -- "$temp_swap" /swapfile; then
+    error "无法安装新的 /swapfile，正在恢复"
+    rollback_swap_transaction || true
+    return 1
+  fi
+  if ! swapon /swapfile; then
+    error "无法启用新 Swap，正在恢复"
+    rollback_swap_transaction || true
+    return 1
+  fi
+  if ! rewrite_swap_fstab add; then
+    error "无法写入 /etc/fstab，正在恢复"
+    rollback_swap_transaction || true
+    return 1
+  fi
+
+  if swap_is_active /swapfile && swap_is_managed; then
+    commit_transaction || return 1
+    success "Swap 已创建并持久化"
+    swapon --show
+  else
+    error "Swap 验证失败"
+    return 1
+  fi
+}
+
+disable_managed_swap() {
+  if ! swap_is_managed; then
+    warn "未发现本脚本管理的 Swap 配置"
+    return 0
+  fi
+  warn "该操作会停用并删除 /swapfile"
+  confirm_phrase "确认删除本脚本管理的 Swap" "DISABLE SWAP" || {
+    info "已取消停用 Swap"
+    return 0
+  }
+
+  if (( DRY_RUN )); then
+    printf '%s[预览]%s 停用 /swapfile、删除持久化配置和文件\n' "$C_YELLOW" "$C_RESET"
+    return 0
+  fi
+
+  SWAP_OLD_SIZE_MIB=0
+  [[ -e /swapfile ]] && SWAP_OLD_SIZE_MIB=$(( ($(stat -c %s /swapfile) + 1048575) / 1048576 ))
+  SWAP_OLD_ACTIVE=0
+  swap_is_active /swapfile && SWAP_OLD_ACTIVE=1
+  SWAP_OLD_FS_TYPE="$(findmnt -no FSTYPE / 2>/dev/null || printf 'unknown')"
+  start_backup_batch swap-disable rollback_swap_transaction || return 1
+  record_metadata swap_old_size_mib "$SWAP_OLD_SIZE_MIB" || return 1
+  record_metadata swap_old_active "$SWAP_OLD_ACTIVE" || return 1
+  record_metadata swap_fs_type "$SWAP_OLD_FS_TYPE" || return 1
+  backup_file /etc/fstab || return 1
+  mark_transaction_staged || return 1
+  if swap_is_active /swapfile && ! swapoff /swapfile; then
+    error "无法停用 /swapfile"
+    return 1
+  fi
+  if ! rewrite_swap_fstab remove; then
+    rollback_swap_transaction || true
+    return 1
+  fi
+  if ! rm -f -- /swapfile; then
+    error "无法删除 /swapfile，正在恢复"
+    rollback_swap_transaction || true
+    return 1
+  fi
+  commit_transaction || return 1
+  success "本脚本管理的 Swap 已停用并删除"
+}
+
+module_swap() {
+  local choice
+  heading "Swap"
+  free -h
+  printf '\n'
+  swapon --show
+  printf '\n'
+  df -hT /
+  printf '\n'
+  print_spaced_menu \
+    "1. 创建或替换本脚本管理的 Swap" \
+    "2. 停用并删除本脚本管理的 Swap" \
+    "0. 返回主菜单"
+  printf '请选择: '
+  IFS= read -r choice || return 0
+  case "$choice" in
+    1) configure_swap ;;
+    2) disable_managed_swap ;;
+    0) return 0 ;;
+    *) error "无效选项"; return 1 ;;
+  esac
+}
+
+bbr_available() {
+  sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | tr ' ' '\n' | grep -Fxq bbr
+}
+
+rollback_bbr_transaction() {
+  rollback_current_batch || return 1
+  local failed=0
+  if [[ -n "$BBR_OLD_QDISC" ]]; then
+    sysctl -w "net.core.default_qdisc=${BBR_OLD_QDISC}" >/dev/null 2>&1 || failed=1
+  fi
+  if [[ -n "$BBR_OLD_ALGORITHM" ]]; then
+    sysctl -w "net.ipv4.tcp_congestion_control=${BBR_OLD_ALGORITHM}" >/dev/null 2>&1 || failed=1
+  fi
+  if (( failed )); then
+    mark_manual_recovery "BBR 文件已恢复，但运行参数恢复失败"
+    return 1
+  fi
+}
+
+module_bbr() {
+  local module_file="/etc/modules-load.d/vps-init-bbr.conf"
+  local sysctl_file="/etc/sysctl.d/99-vps-init-bbr.conf"
+  local module_content sysctl_content current_algorithm current_qdisc virtualization
+
+  heading "BBR"
+  printf '内核: %s\n' "$(uname -r)"
+  printf '可用算法: %s\n' "$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || printf 'unknown')"
+  current_algorithm="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf 'unknown')"
+  current_qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || printf 'unknown')"
+  BBR_OLD_ALGORITHM="$current_algorithm"
+  BBR_OLD_QDISC="$current_qdisc"
+  printf '当前算法: %s\n当前队列规则: %s\n' "$current_algorithm" "$current_qdisc"
+  virtualization="$(systemd-detect-virt 2>/dev/null || printf 'none')"
+  printf '虚拟化: %s\n' "$virtualization"
+
+  if [[ "$current_algorithm" == "bbr" && "$current_qdisc" == "fq" ]]; then
+    success "BBR 已启用"
+    return 0
+  fi
+  if ! bbr_available && ! modinfo tcp_bbr >/dev/null 2>&1; then
+    error "当前内核未提供 tcp_bbr，本脚本不会安装或替换内核"
+    return 1
+  fi
+
+  module_content="$MANAGED_HEADER"$'\n'"tcp_bbr"
+  sysctl_content="$MANAGED_HEADER"$'\n'
+  sysctl_content+="net.core.default_qdisc=fq"$'\n'
+  sysctl_content+="net.ipv4.tcp_congestion_control=bbr"
+
+  heading "BBR 修改计划"
+  printf '写入: %s\n' "$module_file"
+  printf '写入: %s\n' "$sysctl_file"
+  printf '设置: net.core.default_qdisc=fq\n'
+  printf '设置: net.ipv4.tcp_congestion_control=bbr\n'
+  warn "容器环境可能由宿主机控制这些参数"
+  confirm "确认启用 BBR" || {
+    info "已取消 BBR 配置"
+    return 0
+  }
+
+  start_backup_batch bbr rollback_bbr_transaction || return 1
+  record_metadata bbr_algorithm "$BBR_OLD_ALGORITHM" || return 1
+  record_metadata bbr_qdisc "$BBR_OLD_QDISC" || return 1
+  write_managed_file "$module_file" 644 "$module_content" || return 1
+  write_managed_file "$sysctl_file" 644 "$sysctl_content" || {
+    rollback_current_batch
+    return 1
+  }
+  if (( DRY_RUN )); then
+    info "预览完成，未修改 BBR 配置"
+    return 0
+  fi
+
+  if ! bbr_available && ! modprobe tcp_bbr; then
+    error "无法加载 tcp_bbr，正在恢复"
+    rollback_bbr_transaction
+    return 1
+  fi
+  if ! sysctl --system; then
+    error "sysctl 配置应用失败，正在恢复"
+    rollback_bbr_transaction
+    return 1
+  fi
+  current_algorithm="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+  current_qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+  if [[ "$current_algorithm" != "bbr" || "$current_qdisc" != "fq" ]]; then
+    error "BBR 最终状态不符合预期，正在恢复"
+    rollback_bbr_transaction
+    return 1
+  fi
+  commit_transaction || return 1
+  success "BBR 已启用"
+  ss -tin 2>/dev/null | head -n 20 || true
+}
+
+text_display_width() {
+  local text="$1"
+  local character width=0
+  while [[ -n "$text" ]]; do
+    character="${text:0:1}"
+    text="${text:1}"
+    if [[ "$character" == [[:ascii:]] ]]; then
+      ((width += 1))
+    else
+      ((width += 2))
+    fi
+  done
+  printf '%s' "$width"
+}
+
+print_display_padding() {
+  local text="$1"
+  local target_width="$2"
+  local width padding
+  width="$(text_display_width "$text")"
+  padding=$((target_width - width))
+  (( padding < 1 )) && padding=1
+  printf '%*s' "$padding" ''
+}
+
+show_ufw_numbered() {
+  local line number remainder
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^\[[[:space:]]*([0-9]+)\][[:space:]]*(.*)$ ]]; then
+      number="${BASH_REMATCH[1]}"
+      remainder="${BASH_REMATCH[2]}"
+      printf '[%s]' "$number"
+      print_display_padding "[$number]" 5
+      printf '%s\n' "$remainder"
+    else
+      printf '%s\n' "$line"
+    fi
+  done < <(LANG=C ufw status numbered)
+}
+
+status_line() {
+  local state="$1"
+  local label="$2"
+  local detail="$3"
+  local color="$C_BLUE"
+  local state_text
+  case "$state" in
+    正常) color="$C_GREEN"; state_text="正常" ;;
+    警告) color="$C_YELLOW"; state_text="警告" ;;
+    未配置) color="$C_YELLOW"; state_text="未配置" ;;
+    失败) color="$C_RED"; state_text="失败" ;;
+    *) state_text="$state" ;;
+  esac
+  printf '%s[%s]%s' "$color" "$state_text" "$C_RESET"
+  print_display_padding "[$state_text]" 8
+  printf '%s' "$label"
+  print_display_padding "$label" 14
+  printf ' %s\n' "$detail"
+}
+
+check_current_status() {
+  local update_count ports_text auth_password auth_keyboard current_tz sync_state
+  local current_algorithm current_qdisc configured_f2b_ports
+  local dependency_count
+  local -a ports=()
+  local all_listening=1
+  local port fail2ban_ports_match=1
+
+  heading "当前状态"
+  status_line 正常 "系统" "${OS_NAME} / $(uname -r)"
+
+  update_count="$(apt list --upgradable 2>/dev/null | awk 'NR > 1 {count++} END {print count+0}')"
+  dependency_count="$(apt_upgrade_new_dependencies | awk 'NF {count++} END {print count+0}')"
+  if [[ -e /var/run/reboot-required ]]; then
+    status_line 警告 "系统更新" "${update_count} 个可更新包，新增依赖 ${dependency_count} 个，需要重启"
+  elif (( update_count > 0 )); then
+    status_line 警告 "系统更新" "${update_count} 个可更新包，新增依赖 ${dependency_count} 个"
+  else
+    status_line 正常 "系统更新" "本地索引未发现待更新包"
+  fi
+
+  if ufw_installed; then
+    if ufw_active; then
+      status_line 正常 "UFW" "已启用，IPv6=$(ufw_ipv6_enabled && printf 'yes' || printf 'no')"
+    else
+      status_line 未配置 "UFW" "已安装但未启用"
+    fi
+  else
+    status_line 未配置 "UFW" "未安装，请通过选项 1 安装环境"
+  fi
+
+  if sshd_command >/dev/null 2>&1; then
+    mapfile -t ports < <(effective_ssh_ports)
+    ports_text="${ports[*]}"
+    for port in "${ports[@]}"; do
+      if ! ssh_port_listening "$port"; then
+        all_listening=0
+      fi
+    done
+    if (( all_listening )); then
+      status_line 正常 "SSH 端口" "${ports_text}，均在监听"
+    else
+      status_line 失败 "SSH 端口" "有效配置为 ${ports_text}，存在未监听端口"
+    fi
+    auth_password="$(effective_auth_value root passwordauthentication 2>/dev/null || printf 'unknown')"
+    auth_keyboard="$(effective_auth_value root kbdinteractiveauthentication 2>/dev/null || printf 'unknown')"
+    if [[ "$auth_password" == "no" && "$auth_keyboard" == "no" ]]; then
+      status_line 正常 "SSH 密码认证" "PasswordAuthentication=no，KbdInteractiveAuthentication=no"
+    else
+      status_line 警告 "SSH 密码认证" "password=${auth_password}，keyboard-interactive=${auth_keyboard}"
+    fi
+  else
+    status_line 失败 "SSH" "找不到 sshd"
+  fi
+
+  if command -v fail2ban-client >/dev/null 2>&1 && package_installed fail2ban; then
+    if systemctl is-active --quiet fail2ban.service 2>/dev/null && fail2ban-client status sshd >/dev/null 2>&1; then
+      configured_f2b_ports="$(fail2ban_runtime_port 2>/dev/null || true)"
+      for port in "${ports[@]:-22}"; do
+        if [[ ",${configured_f2b_ports}," != *",${port},"* ]]; then
+          fail2ban_ports_match=0
+        fi
+      done
+      if [[ -z "$configured_f2b_ports" ]] || (( fail2ban_ports_match == 0 )); then
+        status_line 警告 "Fail2ban" "SSH jail 已运行，但端口可能与 SSH 不一致"
+      else
+        status_line 正常 "Fail2ban" "SSH jail 已运行"
+      fi
+    else
+      status_line 警告 "Fail2ban" "已安装，但服务或 SSH jail 未运行"
+    fi
+  else
+    status_line 未配置 "Fail2ban" "未安装，请通过选项 1 安装环境"
+  fi
+
+  current_tz="$(timedatectl show --property=Timezone --value 2>/dev/null || printf 'unknown')"
+  sync_state="$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || printf 'unknown')"
+  if [[ "$sync_state" == "yes" ]]; then
+    status_line 正常 "时区" "${current_tz}，时间已同步"
+  else
+    status_line 警告 "时区" "${current_tz}，时间同步状态 ${sync_state}"
+  fi
+
+  if swapon --show=NAME --noheadings 2>/dev/null | grep -q .; then
+    if swap_is_managed && swap_is_active /swapfile; then
+      status_line 正常 "Swap" "$(swapon --show=NAME,SIZE --noheadings | xargs)"
+    else
+      status_line 正常 "Swap" "已启用，未完全由本脚本管理"
+    fi
+  else
+    status_line 未配置 "Swap" "未启用"
+  fi
+
+  current_algorithm="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf 'unknown')"
+  current_qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || printf 'unknown')"
+  if [[ "$current_algorithm" == "bbr" && "$current_qdisc" == "fq" ]]; then
+    status_line 正常 "BBR" "algorithm=bbr，qdisc=fq"
+  elif bbr_available; then
+    status_line 未配置 "BBR" "内核支持，当前 algorithm=${current_algorithm}，qdisc=${current_qdisc}"
+  else
+    status_line 警告 "BBR" "当前内核或宿主机未提供 BBR"
+  fi
+
+  local sudo_members
+  sudo_members="$(getent group sudo 2>/dev/null | awk -F: '{print $4}')"
+  status_line 正常 "管理用户" "sudo 组成员: ${sudo_members:-无}"
+
+  printf '\nUFW 规则:\n'
+  if ufw_installed; then
+    show_ufw_numbered
+  else
+    printf '未安装\n'
+  fi
+}
+
+restore_path_allowed() {
+  case "$1" in
+    /etc/ssh/sshd_config|/etc/ssh/sshd_config.d/*.conf|\
+    /etc/fail2ban/jail.d/*.local|/etc/fstab|\
+    /etc/sudoers.d/90-vps-init-*|\
+    /home/*/.ssh/authorized_keys|\
+    /etc/modules-load.d/vps-init-bbr.conf|/etc/sysctl.d/99-vps-init-bbr.conf|\
+    /etc/ufw/user.rules|/etc/ufw/user6.rules|/etc/ufw/ufw.conf|/etc/default/ufw)
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_restored_services() {
+  local -a paths=("$@")
+  local path ssh_changed=0 ufw_changed=0 fail2ban_changed=0 sysctl_changed=0 fstab_changed=0
+  local sudo_changed=0
+  for path in "${paths[@]}"; do
+    case "$path" in
+      /etc/ssh/*) ssh_changed=1 ;;
+      /etc/ufw/*|/etc/default/ufw) ufw_changed=1 ;;
+      /etc/fail2ban/*) fail2ban_changed=1 ;;
+      /etc/sysctl.d/*|/etc/modules-load.d/*) sysctl_changed=1 ;;
+      /etc/fstab) fstab_changed=1 ;;
+      /etc/sudoers.d/*) sudo_changed=1 ;;
+    esac
+  done
+
+  if (( ssh_changed )); then
+    validate_sshd_config || return 1
+    if ufw_installed && ufw_active; then
+      while IFS= read -r port; do
+        if ! ufw_rule_exists "${port}/tcp"; then
+          error "恢复后的 SSH 端口 ${port} 未被当前 UFW 放行"
+          return 1
+        fi
+      done < <(effective_ssh_ports)
+    fi
+    reload_ssh || return 1
+  fi
+  if (( ufw_changed )) && ufw_installed; then
+    local saved_ufw_enabled="no"
+    if grep -Eq '^[[:space:]]*ENABLED=yes([[:space:]]|$)' /etc/ufw/ufw.conf 2>/dev/null; then
+      saved_ufw_enabled=yes
+    fi
+    if [[ "$saved_ufw_enabled" == "yes" ]]; then
+      while IFS= read -r port; do
+        if ! ufw_saved_rule_exists "${port}/tcp"; then
+          error "恢复后的 UFW 配置未放行当前 SSH 端口 ${port}"
+          return 1
+        fi
+      done < <(effective_ssh_ports)
+      ufw --force enable || return 1
+      ufw reload || return 1
+    else
+      ufw --force disable || return 1
+    fi
+  fi
+  if (( fail2ban_changed )) && command -v fail2ban-client >/dev/null 2>&1; then
+    fail2ban-client -t || return 1
+    if [[ "${RESTORE_METADATA[fail2ban_enabled]:-}" == "1" ]]; then
+      systemctl enable fail2ban.service || return 1
+    elif [[ "${RESTORE_METADATA[fail2ban_enabled]:-}" == "0" ]]; then
+      systemctl disable fail2ban.service || return 1
+    fi
+    if [[ "${RESTORE_METADATA[fail2ban_active]:-}" == "1" ]]; then
+      systemctl restart fail2ban.service || return 1
+    elif [[ "${RESTORE_METADATA[fail2ban_active]:-}" == "0" ]]; then
+      systemctl stop fail2ban.service || return 1
+    else
+      systemctl try-restart fail2ban.service || return 1
+    fi
+  fi
+  if (( sysctl_changed )); then
+    sysctl --system || return 1
+    if [[ -n "${RESTORE_METADATA[bbr_qdisc]:-}" && "${RESTORE_METADATA[bbr_qdisc]}" != "unknown" ]]; then
+      sysctl -w "net.core.default_qdisc=${RESTORE_METADATA[bbr_qdisc]}" || return 1
+    fi
+    if [[ -n "${RESTORE_METADATA[bbr_algorithm]:-}" && "${RESTORE_METADATA[bbr_algorithm]}" != "unknown" ]]; then
+      sysctl -w "net.ipv4.tcp_congestion_control=${RESTORE_METADATA[bbr_algorithm]}" || return 1
+    fi
+  fi
+  if (( fstab_changed )); then
+    findmnt --verify --tab-file /etc/fstab >/dev/null || return 1
+    if [[ -n "${RESTORE_METADATA[swap_old_size_mib]:-}" ]]; then
+      local restore_size="${RESTORE_METADATA[swap_old_size_mib]}"
+      local restore_active="${RESTORE_METADATA[swap_old_active]:-0}"
+      local restore_fs="${RESTORE_METADATA[swap_fs_type]:-$(findmnt -no FSTYPE /)}"
+      [[ "$restore_size" =~ ^[0-9]+$ && "$restore_active" =~ ^[01]$ ]] || return 1
+      if swap_is_active /swapfile && ! swapoff /swapfile; then
+        return 1
+      fi
+      rm -f -- /swapfile || return 1
+      if (( restore_size > 0 )); then
+        create_swap_payload /swapfile "$restore_size" "$restore_fs" || return 1
+        if (( restore_active )) && ! swapon /swapfile; then
+          return 1
+        fi
+      fi
+    elif grep -Eq '^[[:space:]]*/swapfile[[:space:]]+[^[:space:]]+[[:space:]]+swap[[:space:]]' /etc/fstab; then
+      if [[ ! -e /swapfile ]]; then
+        error "/etc/fstab 要求启用 /swapfile，但文件不存在"
+        return 1
+      fi
+      swap_is_active /swapfile || swapon /swapfile || return 1
+    elif swap_is_active /swapfile; then
+      swapoff /swapfile || return 1
+    fi
+  fi
+  if (( sudo_changed )); then
+    visudo -cf /etc/sudoers || return 1
+  fi
+}
+
+rollback_restore_transaction() {
+  rollback_current_batch || return 1
+  RESTORE_METADATA=()
+  local key
+  for key in "${!RESTORE_GUARD_METADATA[@]}"; do
+    RESTORE_METADATA["$key"]="${RESTORE_GUARD_METADATA[$key]}"
+  done
+  if ! validate_restored_services "${RESTORE_GUARD_PATHS[@]}"; then
+    mark_manual_recovery "恢复保护批次已还原文件，但运行状态校验失败"
+    return 1
+  fi
+}
+
+restore_backup_batch() {
+  local batch="$1"
+  local source_dir source_manifest kind path state hash current_state current_hash backup_path
+  local -a paths=()
+  local -A before_state=() before_hash=() after_state=() after_hash=() seen=()
+  local guard_bbr_algorithm guard_bbr_qdisc guard_fail_active=0 guard_fail_enabled=0
+  local guard_swap_size=0 guard_swap_active=0 guard_swap_fs
+  RESTORE_METADATA=()
+
+  if [[ -z "$batch" || "$batch" == *..* || ! "$batch" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    error "备份批次名称无效"
+    return 1
+  fi
+  source_dir="${BACKUP_ROOT}/${batch}"
+  source_manifest="${source_dir}/manifest.tsv"
+  if [[ ! -d "$source_dir" || ! -f "$source_manifest" ]]; then
+    error "备份批次不存在: ${batch}"
+    return 1
+  fi
+
+  while IFS=$'\t' read -r kind path state hash; do
+    if [[ "$kind" == "META" ]]; then
+      [[ "$path" =~ ^[a-zA-Z0-9_-]+$ ]] || {
+        error "备份元数据键无效: ${path}"
+        return 1
+      }
+      RESTORE_METADATA["$path"]="$state"
+      continue
+    fi
+    [[ "$kind" == "BEFORE" || "$kind" == "AFTER" ]] || continue
+    restore_path_allowed "$path" || {
+      error "备份清单包含不允许恢复的路径: ${path}"
+      return 1
+    }
+    if [[ -z "${seen[$path]+x}" ]]; then
+      seen["$path"]=1
+      paths+=("$path")
+    fi
+    if [[ "$kind" == "BEFORE" ]]; then
+      before_state["$path"]="$state"
+      before_hash["$path"]="$hash"
+    else
+      after_state["$path"]="$state"
+      after_hash["$path"]="$hash"
+    fi
+  done <"$source_manifest"
+
+  ((${#paths[@]} > 0)) || {
+    error "备份清单中没有可恢复文件"
+    return 1
+  }
+
+  for path in "${paths[@]}"; do
+    if [[ -z "${before_state[$path]+x}" || -z "${after_state[$path]+x}" ]]; then
+      error "备份清单不完整: ${path}"
+      return 1
+    fi
+    current_state="$(path_state "$path")"
+    current_hash="$(path_hash "$path")"
+    if [[ "$current_state" != "${after_state[$path]}" || "$current_hash" != "${after_hash[$path]}" ]]; then
+      error "${path} 在备份后又被修改，停止自动恢复"
+      return 1
+    fi
+    if [[ "${before_state[$path]}" == "present" ]]; then
+      backup_path="${source_dir}/files${path}"
+      if [[ ! -e "$backup_path" || "$(path_hash "$backup_path")" != "${before_hash[$path]}" ]]; then
+        error "备份文件缺失或摘要不匹配: ${path}"
+        return 1
+      fi
+    fi
+  done
+
+  heading "恢复计划"
+  printf '备份批次: %s\n' "$batch"
+  printf '恢复文件:\n'
+  printf '  %s\n' "${paths[@]}"
+  warn "恢复后脚本会校验并重载受影响的服务"
+  confirm_phrase "确认恢复以上配置" "RESTORE" || {
+    info "已取消恢复"
+    return 0
+  }
+
+  guard_bbr_algorithm="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+  guard_bbr_qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+  systemctl is-active --quiet fail2ban.service 2>/dev/null && guard_fail_active=1
+  systemctl is-enabled --quiet fail2ban.service 2>/dev/null && guard_fail_enabled=1
+  [[ -e /swapfile ]] && guard_swap_size=$(( ($(stat -c %s /swapfile) + 1048575) / 1048576 ))
+  swap_is_active /swapfile && guard_swap_active=1
+  guard_swap_fs="$(findmnt -no FSTYPE / 2>/dev/null || printf 'unknown')"
+
+  RESTORE_GUARD_PATHS=("${paths[@]}")
+  RESTORE_GUARD_METADATA=()
+  RESTORE_GUARD_METADATA[bbr_algorithm]="$guard_bbr_algorithm"
+  RESTORE_GUARD_METADATA[bbr_qdisc]="$guard_bbr_qdisc"
+  RESTORE_GUARD_METADATA[fail2ban_active]="$guard_fail_active"
+  RESTORE_GUARD_METADATA[fail2ban_enabled]="$guard_fail_enabled"
+  RESTORE_GUARD_METADATA[swap_old_size_mib]="$guard_swap_size"
+  RESTORE_GUARD_METADATA[swap_old_active]="$guard_swap_active"
+  RESTORE_GUARD_METADATA[swap_fs_type]="$guard_swap_fs"
+  start_backup_batch restore-guard rollback_restore_transaction || return 1
+  record_metadata bbr_algorithm "$guard_bbr_algorithm" || return 1
+  record_metadata bbr_qdisc "$guard_bbr_qdisc" || return 1
+  record_metadata fail2ban_active "$guard_fail_active" || return 1
+  record_metadata fail2ban_enabled "$guard_fail_enabled" || return 1
+  record_metadata swap_old_size_mib "$guard_swap_size" || return 1
+  record_metadata swap_old_active "$guard_swap_active" || return 1
+  record_metadata swap_fs_type "$guard_swap_fs" || return 1
+  for path in "${paths[@]}"; do
+    backup_file "$path" || {
+      rollback_current_batch
+      return 1
+    }
+  done
+
+  mark_transaction_staged || return 1
+
+  for path in "${paths[@]}"; do
+    if [[ "${before_state[$path]}" == "present" ]]; then
+      backup_path="${source_dir}/files${path}"
+      if ! mkdir -p -- "$(dirname -- "$path")" || ! cp -a -- "$backup_path" "$path"; then
+        rollback_current_batch
+        return 1
+      fi
+    else
+      if ! rm -f -- "$path"; then
+        rollback_current_batch
+        return 1
+      fi
+    fi
+  done
+
+  if ! validate_restored_services "${paths[@]}"; then
+    error "恢复后的配置校验失败，正在还原恢复前状态"
+    rollback_restore_transaction || true
+    return 1
+  fi
+  for path in "${paths[@]}"; do
+    record_after_file "$path" || {
+      rollback_current_batch || true
+      return 1
+    }
+  done
+  commit_transaction || return 1
+  success "配置已从备份批次 ${batch} 恢复"
+}
+
+close_active_transaction() {
+  (( TRANSACTION_ACTIVE )) || return 0
+  warn "检测到未提交事务 ${BACKUP_DIR##*/}，开始安全收尾"
+  if [[ "$TRANSACTION_STATUS" == "PREPARED" && ${#BACKED_UP[@]} -eq 0 ]]; then
+    set_transaction_status ROLLED_BACK || return 1
+    TRANSACTION_ACTIVE=0
+    TRANSACTION_ROLLBACK_HANDLER=""
+    return 0
+  fi
+  if [[ -n "$TRANSACTION_ROLLBACK_HANDLER" ]] && declare -F "$TRANSACTION_ROLLBACK_HANDLER" >/dev/null; then
+    "$TRANSACTION_ROLLBACK_HANDLER" || return 1
+  else
+    rollback_current_batch || return 1
+  fi
+}
+
+run_menu_module() {
+  local function_name="$1"
+  local label="$2"
+  local rc=0
+  "$function_name" || rc=$?
+  if (( TRANSACTION_ACTIVE )); then
+    close_active_transaction || rc=1
+  fi
+  (( rc == 0 )) || warn "${label}未完成"
+  return "$rc"
+}
+
+main_menu() {
+  local choice
+  while true; do
+    heading "LeeYe Init ${SCRIPT_VERSION}"
+    printf '系统: %s\n' "$OS_NAME"
+    (( DRY_RUN )) && printf '%s预览模式已启用%s\n' "$C_YELLOW" "$C_RESET"
+    printf '\n系统更新、安全、网络和性能的初始化设置都在这里，想调哪项就选哪项！\n'
+    printf '下次输入 ini，随时召回主菜单( •̀ᴗ•́ )و ̑̑\n\n'
+    print_spaced_menu \
+      "1.  系统更新与环境安装" \
+      "2.  防火墙" \
+      "3.  SSH端口" \
+      "4.  Fail2ban" \
+      "5.  禁用密码登录" \
+      "6.  时区" \
+      "7.  Swap" \
+      "8.  BBR" \
+      "9.  用户管理" \
+      "99. 检查当前状态" \
+      "0.  退出"
+    printf '请选择: '
+    IFS= read -r choice || return 0
+    case "$choice" in
+      1) run_menu_module module_environment "系统更新与环境安装"; pause_menu ;;
+      2) run_menu_module module_firewall "防火墙操作"; pause_menu ;;
+      3) run_menu_module module_ssh_port "SSH 端口操作"; pause_menu ;;
+      4) run_menu_module module_fail2ban "Fail2ban 操作"; pause_menu ;;
+      5) run_menu_module module_disable_password_login "禁用密码登录"; pause_menu ;;
+      6) run_menu_module module_timezone "时区操作"; pause_menu ;;
+      7) run_menu_module module_swap "Swap 操作"; pause_menu ;;
+      8) run_menu_module module_bbr "BBR 操作"; pause_menu ;;
+      9) run_menu_module module_user_management "用户管理操作"; pause_menu ;;
+      99) check_current_status; pause_menu ;;
+      0) info "退出脚本"; return 0 ;;
+      *) warn "无效选项，请重新输入" ;;
+    esac
+  done
+}
+
+main() {
+  local mode="menu"
+  local restore_batch=""
+  local -a original_args=("$@")
+
+  while (($# > 0)); do
+    case "$1" in
+      --help|-h)
+        show_help
+        return 0
+        ;;
+      --dry-run)
+        DRY_RUN=1
+        ;;
+      --check)
+        mode=check
+        ;;
+      --restore)
+        shift
+        if (($# == 0)); then
+          error "--restore 需要备份批次名称"
+          return 2
+        fi
+        mode=restore
+        restore_batch="$1"
+        ;;
+      *)
+        error "未知参数: $1"
+        show_help
+        return 2
+        ;;
+    esac
+    shift
+  done
+
+  if (( DRY_RUN )) && [[ "$mode" != "menu" ]]; then
+    error "--dry-run 只能与交互菜单一起使用"
+    return 2
+  fi
+  if (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && [[ -t 0 ]]; then
+    local source_path
+    source_path="$(readlink -f "${BASH_SOURCE[0]}")" || return 1
+    exec sudo -- "$source_path" "${original_args[@]}"
+  fi
+  preflight || return 1
+
+  case "$mode" in
+    check)
+      check_current_status
+      ;;
+    restore)
+      setup_runtime_dirs || return 1
+      restore_backup_batch "$restore_batch"
+      ;;
+    menu)
+      setup_runtime_dirs || return 1
+      install_shortcut || return 1
+      check_pending_transactions || return 1
+      main_menu
+      ;;
+  esac
+}
+
+handle_signal() {
+  INTERRUPTED=1
+  printf '\n'
+  warn "收到中断信号，正在处理当前事务"
+  exit 130
+}
+
+handle_exit() {
+  local rc=$?
+  trap - EXIT INT TERM
+  if (( TRANSACTION_ACTIVE )); then
+    close_active_transaction || rc=1
+  fi
+  cleanup_temp_dir || rc=1
+  if (( MANUAL_RECOVERY_REQUIRED )); then
+    warn "存在需要人工检查的恢复项目，请查看日志和备份批次"
+    (( rc == 0 )) && rc=1
+  fi
+  if (( LOG_WRITE_FAILED )); then
+    printf '[警告] 本次运行存在日志写入失败\n' >&2
+    (( rc == 0 )) && rc=1
+  fi
+  exit "$rc"
+}
+
+trap handle_signal INT TERM
+trap handle_exit EXIT
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
