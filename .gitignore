@@ -1,0 +1,22 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa
+id_ed25519
+
+# Runtime and backup files
+*.log
+*.bak
+*.backup
+*.swp
+*.swo
+*~
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
